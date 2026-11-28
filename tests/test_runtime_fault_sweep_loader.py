@@ -20,6 +20,8 @@ ROBOT_PATH = ROOT / "tests" / "ota_fault_point.robot"
 IRONPYTHON_HELPERS = (
     ROOT / "scripts" / "boot_outcomes.py",
     ROOT / "scripts" / "writeback_reconstruction.py",
+    ROOT / "scripts" / "recovery_coverage.py",
+    ROOT / "scripts" / "recovery_search.py",
 )
 
 

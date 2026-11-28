@@ -52,6 +52,7 @@ from recovery_search import (
     recovery_trace_size,
     select_first_cut_operations,
 )
+from recovery_coverage import resolve_executed_probe_pcs
 from replay_cross_check import (
     first_pre_cut_trace_difference,
     format_replay_cross_check_error,
@@ -1318,6 +1319,21 @@ if phase2_state_search_raw:
         )
     if not isinstance(phase2_state_search, dict):
         raise RuntimeError('phase2 state search configuration must be a mapping')
+recovery_coverage_raw = get_optional_var('recovery_coverage_b64', '').strip()
+recovery_coverage_config = None
+if recovery_coverage_raw:
+    try:
+        recovery_coverage_config = json.loads(
+            base64.b64decode(recovery_coverage_raw).decode('utf-8')
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            'recovery coverage configuration is malformed: {}'.format(exc)
+        )
+    if not isinstance(recovery_coverage_config, dict):
+        raise RuntimeError('recovery coverage configuration must be a mapping')
+_control_recovery_coverage_pcs = set()
+_in_live_cross_check = False
 calibration_mode = str(monitor.GetVariable('calibration_mode')).lower() in ('1', 'true', 'yes')
 heuristic_trace_required = get_optional_var(
     'heuristic_trace_required', 'false'
@@ -4747,6 +4763,11 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
     })
     if semantic_state is not None:
         record['semantic_state'] = semantic_state
+    if (
+        isinstance(stop_status, dict)
+        and isinstance(stop_status.get('recovery_coverage'), dict)
+    ):
+        record['recovery_coverage'] = dict(stop_status['recovery_coverage'])
     return record
 
 
@@ -5146,7 +5167,7 @@ def _boot_followup_cycle(cycle_index, fault_injected, label, effective_criteria=
     )
     reset_nvmc_for_recovery()
     arm_vtor_watchpoint()
-    status = run_until_done(
+    status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='{}_{}'.format(label, cycle_index),
         expect_writes=False,
@@ -11959,6 +11980,341 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
         status['calibration_stop'] = dict(_calibration_stop_state)
     return status
 
+
+def _recovery_coverage_active():
+    cfg = globals().get('recovery_coverage_config')
+    return bool(
+        not globals().get('calibration_mode', False)
+        and not globals().get('_in_live_cross_check', False)
+        and isinstance(cfg, dict)
+        and cfg.get('enabled')
+    )
+
+
+def _recovery_coverage_probe_pcs():
+    if not _recovery_coverage_active():
+        return ()
+    cfg = globals().get('recovery_coverage_config') or {}
+    return tuple(int(pc) & ~1 for pc in (cfg.get('probe_pcs') or ()))
+
+
+def _recovery_coverage_intervals():
+    if not _recovery_coverage_active():
+        return ()
+    cfg = globals().get('recovery_coverage_config') or {}
+    intervals = []
+    for item in cfg.get('active_intervals') or ():
+        if isinstance(item, dict):
+            start = int(item.get('start', 0)) & ~1
+            end = int(item.get('end', 0))
+        else:
+            start = int(item[0]) & ~1
+            end = int(item[1])
+        if end > start:
+            intervals.append((start, end))
+    return tuple(intervals)
+
+
+def _pc_in_recovery_coverage_intervals(pc, intervals):
+    addr = int(pc) & ~1
+    for start, end in intervals:
+        if start <= addr < end:
+            return True
+    return False
+
+
+def _start_recovery_coverage_boot(cpu_ref, label=''):
+    if not _recovery_coverage_active() or cpu_ref is None:
+        return None
+    cfg = globals().get('recovery_coverage_config') or {}
+    mechanism = str(
+        cfg.get('mechanism') or 'oneshot_address_hooks'
+    ).strip().lower()
+    probe_pcs = _recovery_coverage_probe_pcs()
+    intervals = _recovery_coverage_intervals()
+    t0 = _time.time()
+    hit_pcs = set()
+    armed_pcs = set()
+    callback_time = [0.0]
+    session = {
+        'label': str(label or ''),
+        'mechanism': mechanism,
+        'probe_pcs': probe_pcs,
+        'intervals': intervals,
+        'hit_pcs': hit_pcs,
+        'armed_pcs': armed_pcs,
+        'callback_time': callback_time,
+        'hook_delegate': None,
+        'block_delegate': None,
+        'trace_path': None,
+        'boot_started_at': t0,
+        'setup_overhead_s': 0.0,
+    }
+    if mechanism == 'oneshot_address_hooks':
+        def _on_coverage_pc_hook(cpu_arg, address):
+            cb_t0 = _time.time()
+            pc = as_int(address) & ~1
+            hit_pcs.add(pc)
+            if pc in armed_pcs:
+                armed_pcs.discard(pc)
+                delegate = session['hook_delegate']
+                removed = False
+                if cpu_arg is not None and hasattr(cpu_arg, 'RemoveHook'):
+                    try:
+                        cpu_arg.RemoveHook(pc, delegate)
+                        removed = True
+                    except Exception:
+                        removed = False
+                if not removed and hasattr(cpu_ref, 'RemoveHook'):
+                    try:
+                        cpu_ref.RemoveHook(pc, delegate)
+                    except Exception:
+                        pass
+            callback_time[0] += max(0.0, _time.time() - cb_t0)
+
+        session['hook_delegate'] = _on_coverage_pc_hook
+        if hasattr(cpu_ref, 'AddHook'):
+            for pc in probe_pcs:
+                try:
+                    cpu_ref.AddHook(int(pc), _on_coverage_pc_hook)
+                    armed_pcs.add(int(pc))
+                except Exception:
+                    pass
+    elif mechanism == 'block_begin_hook':
+        probe_set = set(probe_pcs)
+
+        def _on_coverage_block_begin(address, size):
+            cb_t0 = _time.time()
+            pc = as_int(address) & ~1
+            if pc in probe_set or (
+                intervals and _pc_in_recovery_coverage_intervals(pc, intervals)
+            ):
+                hit_pcs.add(pc)
+            callback_time[0] += max(0.0, _time.time() - cb_t0)
+
+        try:
+            from System import Action as _NetAction, UInt64 as _NetUInt64, UInt32 as _NetUInt32
+            block_delegate = _NetAction[_NetUInt64, _NetUInt32](
+                _on_coverage_block_begin
+            )
+        except Exception:
+            block_delegate = _on_coverage_block_begin
+        session['block_delegate'] = block_delegate
+        if hasattr(cpu_ref, 'SetHookAtBlockBegin'):
+            cpu_ref.SetHookAtBlockBegin(block_delegate)
+    elif mechanism == 'execution_tracing':
+        base_path = str(globals().get('result_file') or 'recovery_coverage')
+        trace_path = '{}.cov_trace_{}.log'.format(
+            base_path, int(_time.time() * 1000000)
+        )
+        session['trace_path'] = trace_path
+        try:
+            monitor.Parse(
+                'sysbus.cpu CreateExecutionTracing "cov_tracer" @{} PC'.format(
+                    trace_path
+                )
+            )
+        except Exception:
+            pass
+    session['setup_overhead_s'] = max(0.0, _time.time() - t0)
+    session['boot_started_at'] = _time.time()
+    return session
+
+
+def _stop_recovery_coverage_boot(cpu_ref, session, stop_status=None):
+    if session is None:
+        return None
+    t0 = _time.time()
+    cfg = globals().get('recovery_coverage_config') or {}
+    mechanism = session.get('mechanism') or 'oneshot_address_hooks'
+    hit_pcs = session['hit_pcs']
+    if mechanism == 'oneshot_address_hooks':
+        delegate = session.get('hook_delegate')
+        if cpu_ref is not None and hasattr(cpu_ref, 'RemoveHook'):
+            for pc in list(session['armed_pcs']):
+                try:
+                    cpu_ref.RemoveHook(int(pc), delegate)
+                except Exception:
+                    pass
+        session['armed_pcs'].clear()
+    elif mechanism == 'block_begin_hook':
+        if cpu_ref is not None:
+            if hasattr(cpu_ref, 'ClearHookAtBlockBegin'):
+                try:
+                    cpu_ref.ClearHookAtBlockBegin()
+                except Exception:
+                    pass
+            elif hasattr(cpu_ref, 'SetHookAtBlockBegin'):
+                try:
+                    cpu_ref.SetHookAtBlockBegin(None)
+                except Exception:
+                    pass
+    elif mechanism == 'execution_tracing':
+        try:
+            monitor.Parse('sysbus.cpu DisableExecutionTracing')
+        except Exception:
+            pass
+        trace_path = session.get('trace_path')
+        probe_set = set(session.get('probe_pcs') or ())
+        intervals = session.get('intervals') or ()
+        if trace_path and os.path.isfile(trace_path):
+            try:
+                with open(trace_path, 'r') as trace_file:
+                    for raw_line in trace_file:
+                        token = raw_line.strip().split(':', 1)[0].strip()
+                        if not token:
+                            continue
+                        try:
+                            pc = int(token, 16) & ~1
+                        except ValueError:
+                            continue
+                        if pc in probe_set or (
+                            intervals
+                            and _pc_in_recovery_coverage_intervals(pc, intervals)
+                        ):
+                            hit_pcs.add(pc)
+            except Exception:
+                pass
+            try:
+                os.unlink(trace_path)
+            except Exception:
+                pass
+
+    resolver = globals().get('resolve_executed_probe_pcs')
+    if callable(resolver):
+        canonical_pcs = [
+            int(pc) for pc in resolver(cfg, executed_pcs=sorted(hit_pcs))
+        ]
+    else:
+        canonical_pcs = sorted(int(pc) & ~1 for pc in hit_pcs)
+
+    teardown_overhead_s = max(0.0, _time.time() - t0)
+    setup_overhead_s = float(session.get('setup_overhead_s', 0.0))
+    callback_overhead_s = float((session.get('callback_time') or [0.0])[0])
+    total_overhead_s = setup_overhead_s + callback_overhead_s + teardown_overhead_s
+    if isinstance(stop_status, dict) and stop_status.get('elapsed_s') is not None:
+        boot_wall_s = float(stop_status.get('elapsed_s', 0.0))
+    else:
+        boot_wall_s = max(
+            0.0, _time.time() - float(session.get('boot_started_at', t0))
+        )
+
+    cov_record = {
+        'enabled': True,
+        'mechanism': str(mechanism),
+        'granularity': str(cfg.get('granularity') or 'function_only'),
+        'line_info_available': bool(cfg.get('line_info_available', False)),
+        'executed_pcs': canonical_pcs,
+        'executed_pc_hex': [fmt_u32(pc) for pc in canonical_pcs],
+        'executed_block_count': len(canonical_pcs),
+        'raw_hit_pc_count': len(hit_pcs),
+        'total_probe_pcs': len(session.get('probe_pcs') or ()),
+        'setup_overhead_s': round(setup_overhead_s, 6),
+        'callback_overhead_s': round(callback_overhead_s, 6),
+        'teardown_overhead_s': round(teardown_overhead_s, 6),
+        'recording_overhead_s': round(total_overhead_s, 6),
+        'boot_wall_time_s': round(boot_wall_s, 6),
+        'boots_recorded': 1,
+    }
+    if isinstance(stop_status, dict):
+        stop_status['recovery_coverage'] = cov_record
+        breakdown = stop_status.setdefault('wall_time_breakdown', {})
+        if isinstance(breakdown, dict):
+            breakdown['recovery_coverage_overhead_s'] = round(
+                total_overhead_s, 6
+            )
+    return cov_record
+
+
+def _merge_recovery_coverage_records(primary, extra):
+    if not isinstance(extra, dict) or not extra.get('enabled'):
+        return dict(primary) if isinstance(primary, dict) else None
+    if not isinstance(primary, dict) or not primary.get('enabled'):
+        return dict(extra)
+    merged_pcs = sorted(
+        set(int(pc) & ~1 for pc in (primary.get('executed_pcs') or ()))
+        | set(int(pc) & ~1 for pc in (extra.get('executed_pcs') or ()))
+    )
+    setup_s = float(primary.get('setup_overhead_s', 0.0)) + float(
+        extra.get('setup_overhead_s', 0.0)
+    )
+    cb_s = float(primary.get('callback_overhead_s', 0.0)) + float(
+        extra.get('callback_overhead_s', 0.0)
+    )
+    teardown_s = float(primary.get('teardown_overhead_s', 0.0)) + float(
+        extra.get('teardown_overhead_s', 0.0)
+    )
+    overhead_s = float(primary.get('recording_overhead_s', 0.0)) + float(
+        extra.get('recording_overhead_s', 0.0)
+    )
+    wall_s = float(primary.get('boot_wall_time_s', 0.0)) + float(
+        extra.get('boot_wall_time_s', 0.0)
+    )
+    boots_recorded = int(primary.get('boots_recorded', 1)) + int(
+        extra.get('boots_recorded', 1)
+    )
+    merged = dict(primary)
+    merged.update({
+        'executed_pcs': merged_pcs,
+        'executed_pc_hex': [fmt_u32(pc) for pc in merged_pcs],
+        'executed_block_count': len(merged_pcs),
+        'raw_hit_pc_count': max(
+            len(merged_pcs),
+            int(primary.get('raw_hit_pc_count', 0)),
+            int(extra.get('raw_hit_pc_count', 0)),
+        ),
+        'setup_overhead_s': round(setup_s, 6),
+        'callback_overhead_s': round(cb_s, 6),
+        'teardown_overhead_s': round(teardown_s, 6),
+        'recording_overhead_s': round(overhead_s, 6),
+        'boot_wall_time_s': round(wall_s, 6),
+        'boots_recorded': boots_recorded,
+    })
+    return merged
+
+
+def _attach_result_recovery_coverage(
+    result, signals, statuses, boot_cycle_records=None
+):
+    merged = None
+    for status in statuses or ():
+        if isinstance(status, dict) and isinstance(
+            status.get('recovery_coverage'), dict
+        ):
+            merged = _merge_recovery_coverage_records(
+                merged, status['recovery_coverage']
+            )
+    if boot_cycle_records:
+        for cycle_rec in boot_cycle_records[1:]:
+            if isinstance(cycle_rec, dict) and isinstance(
+                cycle_rec.get('recovery_coverage'), dict
+            ):
+                merged = _merge_recovery_coverage_records(
+                    merged, cycle_rec['recovery_coverage']
+                )
+    if merged is not None:
+        result['recovery_coverage'] = merged
+        if isinstance(signals, dict):
+            signals['recovery_coverage_overhead_s'] = merged.get(
+                'recording_overhead_s', 0.0
+            )
+            signals['recovery_coverage_blocks'] = merged.get(
+                'executed_block_count', 0
+            )
+    return merged
+
+
+def _run_recovery_boot_until_done(cpu_ref, **kwargs):
+    cov_session = _start_recovery_coverage_boot(
+        cpu_ref, label=str(kwargs.get('label', '') or '')
+    )
+    status = None
+    try:
+        status = run_until_done(cpu_ref, **kwargs)
+        return status
+    finally:
+        _stop_recovery_coverage_boot(cpu_ref, cov_session, stop_status=status)
+
 def parse_duration_seconds(default=2.0):
     try:
         return max(0.02, float(run_duration))
@@ -12184,7 +12540,7 @@ def run_read_bit_flip_fault(fault_at):
 
     log('fp={} type=f phase2_step'.format(fault_at))
     arm_vtor_watchpoint()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp{}_f_p2'.format(fault_at),
         expect_writes=False,
@@ -12369,7 +12725,7 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
 
     # Boot.
     arm_vtor_watchpoint()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp{}_tb'.format(fault_at),
         expect_writes=False,
@@ -12610,7 +12966,7 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     saved_stall_s = progress_stall_timeout_s
     if progress_stall_timeout_s <= 0 or progress_stall_timeout_s > 1.0:
         progress_stall_timeout_s = 1.0
-    phase1_status = run_until_done(
+    phase1_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp0x{:X}_p1'.format(skip_addr),
         stop_on_fault=False,
@@ -12810,7 +13166,7 @@ def run_timed_reset_fault(fault_at):
 
     log('fp={} type=t phase2_step'.format(fault_at))
     arm_vtor_watchpoint()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp{}_t_p2'.format(fault_at),
         expect_writes=False,
@@ -12962,7 +13318,7 @@ def run_nvs_corruption_fault(variant_idx):
     reset_nvmc_for_sweep()
     disarm_fault()
     arm_vtor_watchpoint()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='nvs_{}'.format(variant_idx),
         expect_writes=False,
@@ -13014,7 +13370,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     reset_nvmc_for_sweep()
     disarm_fault()
     arm_vtor_watchpoint()
-    p2_status = run_until_done(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=phase2_wall_timeout_s, time_slice=phase2_time_slice)
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(cpu_ref, label='fp{}_m{}_boot'.format(fault_at, m_type), expect_writes=False, zero_writes_is_brick=False, wall_timeout=phase2_wall_timeout_s, time_slice=phase2_time_slice)
     disarm_vtor_watchpoint()
     phase1_ms = int((_time.time() - fp_t0) * 1000)
     vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
@@ -13450,6 +13806,9 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
+    if callable(_attach_cov_fn):
+        _attach_cov_fn(result, signals, (p2_status,), boot_cycle_records)
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         dump_source = 'fault_snapshot' if fault_snapshot_bytes is not None else 'live_flash'
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
@@ -14158,11 +14517,25 @@ def run_execute_fault(
 
         arm_vtor_watchpoint()
         phase1_run_started = _time.time()
-        phase1_status = run_control_phase1(
-            cpu_ref,
-            label='control_p1',
-            vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
+        _start_cov_fn = globals().get('_start_recovery_coverage_boot')
+        _stop_cov_fn = globals().get('_stop_recovery_coverage_boot')
+        _control_cov_session = (
+            _start_cov_fn(cpu_ref, label='control_p1')
+            if callable(_start_cov_fn)
+            else None
         )
+        phase1_status = None
+        try:
+            phase1_status = run_control_phase1(
+                cpu_ref,
+                label='control_p1',
+                vtor_settle_iters=_copy_on_boot_vtor_settle_iters(),
+            )
+        finally:
+            if callable(_stop_cov_fn):
+                _stop_cov_fn(
+                    cpu_ref, _control_cov_session, stop_status=phase1_status
+                )
         if isinstance(phase1_status, dict):
             _phase1_breakdown = phase1_status.setdefault(
                 'wall_time_breakdown', {}
@@ -14216,7 +14589,7 @@ def run_execute_fault(
             except Exception as exc:
                 log('control snapshot capture failed: {}'.format(exc))
 
-        return _build_fault_result(
+        control_result = _build_fault_result(
             fault_at, 'control', False, '0x00000000', actual_writes, signals,
             boot_outcome=boot_outcome, boot_slot=boot_slot,
             eff_criteria=eff_criteria, p2_status=phase1_status,
@@ -14224,6 +14597,17 @@ def run_execute_fault(
             fault_snapshot_bytes=control_snapshot_bytes,
             persist_snapshot=(control_snapshot_bytes is not None),
         )
+        control_cov = (
+            control_result.get('recovery_coverage')
+            if isinstance(control_result, dict)
+            else None
+        )
+        _ctrl_pcs = globals().get('_control_recovery_coverage_pcs')
+        if isinstance(control_cov, dict) and isinstance(_ctrl_pcs, set):
+            _ctrl_pcs.update(
+                int(pc) & ~1 for pc in (control_cov.get('executed_pcs') or ())
+            )
+        return control_result
 
     fp_t0 = _time.time()
     phase1_ms = 0
@@ -14596,7 +14980,7 @@ def run_execute_fault(
             log('fp={} phase2_step'.format(fault_at))
             arm_vtor_watchpoint()
             phase2_run_started = _time.time()
-            phase2_status = run_until_done(
+            phase2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
                 cpu_ref,
                 label='fp{}_p2'.format(fault_at),
                 expect_writes=False,
@@ -14639,7 +15023,7 @@ def run_execute_fault(
             cpu_ref.IsHalted = False
             log('fp={} phase1_continue_non_power'.format(fault_at))
             arm_vtor_watchpoint()
-            phase2_status = run_until_done(
+            phase2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
                 cpu_ref,
                 label='fp{}_p1c'.format(fault_at),
                 wall_timeout=phase2_wall_timeout_s,
@@ -14685,7 +15069,7 @@ def run_execute_fault(
 
         log('fp={} phase2_step (slow path)'.format(fault_at))
         arm_vtor_watchpoint()
-        phase2_status = run_until_done(
+        phase2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='fp{}_p2'.format(fault_at),
             expect_writes=False,
@@ -14705,7 +15089,7 @@ def run_execute_fault(
         # Slow path non-power-loss: continue in the same boot attempt.
         phase2_t0 = _time.time()
         arm_vtor_watchpoint()
-        phase2_status = run_until_done(
+        phase2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='fp{}_p1c'.format(fault_at),
             wall_timeout=phase2_wall_timeout_s,
@@ -14721,7 +15105,7 @@ def run_execute_fault(
         phase2_t0 = _time.time()
         disarm_i2c_fault()
         arm_vtor_watchpoint()
-        phase2_status = run_until_done(
+        phase2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='fp{}_i2c_cont'.format(fault_at),
             wall_timeout=phase2_wall_timeout_s,
@@ -15315,6 +15699,9 @@ def _phase2_chain_evaluated_result(
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
+    if callable(_attach_cov_fn):
+        _attach_cov_fn(result, signals, (status,), boot_cycle_records)
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
             snapshot_bytes=to_py_bytes(snapshot['flash']),
@@ -15579,7 +15966,7 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
     _clear_mram_uncorrectable_read_log()
     arm_vtor_watchpoint()
     try:
-        final_status = run_until_done(
+        final_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='pchain_final_{}'.format(len(cuts)),
             expect_writes=False,
@@ -16046,7 +16433,7 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
 
         log('p2fault p1={} p2={} phase3_step'.format(p1_fault_at, p2_fault_at))
         arm_vtor_watchpoint()
-        p3_status = run_until_done(
+        p3_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='p2fault_p3_{}_{}'.format(p1_fault_at, p2_fault_at),
             expect_writes=False,
@@ -16270,6 +16657,14 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
+    if callable(_attach_cov_fn):
+        _attach_cov_fn(
+            result,
+            signals,
+            (p3_status if p2_injected else p2_status,),
+            boot_cycle_records,
+        )
     if boot_outcome == 'no_boot' and postmortem_dump_no_boot:
         snapshot = saved_flash_p2 if p2_injected else saved_flash_p1
         result['postmortem_partition_dump'] = build_postmortem_partition_dump(
@@ -16581,7 +16976,7 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
 
     log('mf seq={} final_recovery_step'.format(seq))
     arm_vtor_watchpoint()
-    final_status = run_until_done(
+    final_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='mf_final_{}'.format(seq[0]),
         expect_writes=False,
@@ -16648,6 +17043,9 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
+    if callable(_attach_cov_fn):
+        _attach_cov_fn(result, signals, (final_status,), boot_cycle_records)
 
     if backend['kind'] == 'fast':
         backend['data'].FaultFlashSnapshot = None
@@ -18212,7 +18610,7 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     cpu_ref.IsHalted = False
     arm_vtor_watchpoint()
     t_emu = _time.time()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp{}_native_replay_p2'.format(fault_at),
         expect_writes=False,
@@ -18643,7 +19041,7 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     cpu_ref.IsHalted = False
     arm_vtor_watchpoint()
     t_emu = _time.time()
-    p2_status = run_until_done(
+    p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
         cpu_ref,
         label='fp{}_replay_p2'.format(fault_at),
         expect_writes=False,
@@ -19243,7 +19641,7 @@ def _state_search_boot_state(state, chain, generation):
     arm_vtor_watchpoint()
     boot_started = _time.time()
     try:
-        p2_status = run_until_done(
+        p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
             cpu_ref,
             label='recovery_state_{}_{}'.format(generation, len(chain)),
             expect_writes=False,
@@ -19368,6 +19766,7 @@ def _state_search_boot_state(state, chain, generation):
 
 
 def _state_search_live_cross_check(state, chain, generation, operation):
+    global _in_live_cross_check
     if int(generation) < 2 or len(chain) < 2:
         return False
     live_cuts = [
@@ -19377,24 +19776,29 @@ def _state_search_live_cross_check(state, chain, generation, operation):
         )
         for cut in chain
     ]
-    if len(live_cuts) == 2:
-        live_result = run_phase2_fault(
-            live_cuts[0][0],
-            live_cuts[1][0],
-            live_cuts[0][1],
-            live_cuts[1][1],
-            cross_check_expected=state,
-        )
-        status = live_result.get('phase2_fault', {}).get(
-            'cross_check_persistent_state'
-        )
-    else:
-        live_result = run_phase2_fault_chain(
-            live_cuts, cross_check_expected=state
-        )
-        status = live_result.get('phase2_fault_chain', {}).get(
-            'cross_check_persistent_state'
-        )
+    prev_live_flag = globals().get('_in_live_cross_check', False)
+    _in_live_cross_check = True
+    try:
+        if len(live_cuts) == 2:
+            live_result = run_phase2_fault(
+                live_cuts[0][0],
+                live_cuts[1][0],
+                live_cuts[0][1],
+                live_cuts[1][1],
+                cross_check_expected=state,
+            )
+            status = live_result.get('phase2_fault', {}).get(
+                'cross_check_persistent_state'
+            )
+        else:
+            live_result = run_phase2_fault_chain(
+                live_cuts, cross_check_expected=state
+            )
+            status = live_result.get('phase2_fault_chain', {}).get(
+                'cross_check_persistent_state'
+            )
+    finally:
+        _in_live_cross_check = prev_live_flag
     if isinstance(status, dict) and status.get('infrastructure_error'):
         raise RuntimeError(status.get(
             'error',
@@ -19494,6 +19898,14 @@ def run_recovery_state_search():
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
         cross_check=_state_search_live_cross_check,
         plan_only=phase2_state_search.get('plan_only', False),
+        order=str(
+            phase2_state_search.get('order', 'breadth_first')
+            or 'breadth_first'
+        ),
+        max_boots_without_new_coverage=phase2_state_search.get(
+            'max_boots_without_new_coverage'
+        ),
+        initial_coverage=globals().get('_control_recovery_coverage_pcs') or (),
         **shard_options
     )
     checkpoint_path = get_optional_var('state_search_checkpoint', '').strip()

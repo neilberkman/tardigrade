@@ -79,6 +79,12 @@ from boundary_campaigns import (
     resolve_boundary_values,
     resolve_followup_value,
 )
+from recovery_coverage import (
+    RecoveryCoverageError,
+    SUPPORTED_COVERAGE_MECHANISMS,
+    SUPPORTED_STATE_SEARCH_ORDERS,
+    build_recovery_coverage_scope,
+)
 
 try:
     import yaml
@@ -917,6 +923,8 @@ class RecoveryStateSearchConfig:
         "cross_check_every",
         "shard_count",
         "shard_index",
+        "order",
+        "max_boots_without_new_coverage",
     )
 
     def __init__(
@@ -932,6 +940,8 @@ class RecoveryStateSearchConfig:
         plan_only: bool = False,
         shard_count: int = 1,
         shard_index: int = 0,
+        order: str = "breadth_first",
+        max_boots_without_new_coverage: Optional[int] = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.plan_only = bool(plan_only)
@@ -993,9 +1003,34 @@ class RecoveryStateSearchConfig:
                     MAX_PROFILE_FAULT_POINTS
                 )
             )
+        normalized_order = str(order or "breadth_first").strip().lower()
+        if normalized_order not in SUPPORTED_STATE_SEARCH_ORDERS:
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.order: "
+                "expected breadth_first or coverage_guided"
+            )
+        self.order = normalized_order
+        if max_boots_without_new_coverage is not None:
+            if (
+                isinstance(max_boots_without_new_coverage, bool)
+                or not isinstance(max_boots_without_new_coverage, int)
+                or max_boots_without_new_coverage < 1
+                or max_boots_without_new_coverage > MAX_PROFILE_FAULT_POINTS
+            ):
+                raise ProfileError(
+                    "fault_sweep.phase2_fault.state_search.max_boots_without_new_coverage: "
+                    "expected an integer from 1 through {}".format(
+                        MAX_PROFILE_FAULT_POINTS
+                    )
+                )
+            self.max_boots_without_new_coverage: Optional[int] = int(
+                max_boots_without_new_coverage
+            )
+        else:
+            self.max_boots_without_new_coverage = None
 
     def to_runtime_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "enabled": self.enabled,
             **({"plan_only": True} if self.plan_only else {}),
             "first_cuts": {
@@ -1015,6 +1050,85 @@ class RecoveryStateSearchConfig:
             "cross_check_every": self.cross_check_every,
             **({"shard_count": self.shard_count, "shard_index": self.shard_index}
                if self.shard_count > 1 else {}),
+            "order": self.order,
+            "max_boots_without_new_coverage": self.max_boots_without_new_coverage,
+        }
+        return payload
+
+
+class RecoveryCoverageConfig:
+    """Configuration for recovery-boot code coverage recording."""
+
+    __slots__ = (
+        "enabled",
+        "functions",
+        "source_files",
+        "address_ranges",
+        "mechanism",
+        "scope",
+    )
+
+    def __init__(
+        self,
+        enabled: bool = False,
+        functions: Optional[List[str]] = None,
+        source_files: Optional[List[str]] = None,
+        address_ranges: Optional[List[Tuple[int, int]]] = None,
+        mechanism: str = "oneshot_address_hooks",
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.functions = list(functions or [])
+        self.source_files = list(source_files or [])
+        self.address_ranges = list(address_ranges or [])
+        normalized_mechanism = (
+            str(mechanism or "oneshot_address_hooks").strip().lower()
+        )
+        if normalized_mechanism not in SUPPORTED_COVERAGE_MECHANISMS:
+            raise ProfileError(
+                "fault_sweep.recovery_coverage.mechanism: expected one of {}, got {!r}".format(
+                    list(SUPPORTED_COVERAGE_MECHANISMS), mechanism
+                )
+            )
+        self.mechanism = normalized_mechanism
+        if self.enabled and not (
+            self.functions or self.source_files or self.address_ranges
+        ):
+            raise ProfileError(
+                "fault_sweep.recovery_coverage: requires at least one of "
+                "functions, source_files, or address_ranges when enabled"
+            )
+        self.scope = scope
+
+    def to_runtime_dict(self) -> Dict[str, Any]:
+        if not self.enabled:
+            return {"enabled": False}
+        if isinstance(self.scope, dict):
+            return {
+                "enabled": True,
+                "mechanism": self.scope.get("mechanism", self.mechanism),
+                "granularity": self.scope.get("granularity", "function_only"),
+                "line_info_available": bool(
+                    self.scope.get("line_info_available")
+                ),
+                "probe_pcs": list(self.scope.get("probe_pcs") or ()),
+                "active_intervals": list(
+                    self.scope.get("active_intervals") or ()
+                ),
+                "basic_blocks": [
+                    [int(bb["start"]), int(bb["end"])]
+                    for bb in (self.scope.get("basic_blocks") or ())
+                ],
+            }
+        return {
+            "enabled": True,
+            "mechanism": self.mechanism,
+            "functions": list(self.functions),
+            "source_files": list(self.source_files),
+            "address_ranges": [
+                {"start": start, "end": end}
+                for start, end in self.address_ranges
+            ],
         }
 
 
@@ -1979,6 +2093,7 @@ class FaultSweepConfig:
         "include_erase_fault_points",
         "trace_replay_cross_check_every",
         "_driver_functions",
+        "recovery_coverage",
     )
 
     def __init__(
@@ -2041,6 +2156,7 @@ class FaultSweepConfig:
         trace_replay_cross_check_every: int = 100,
         recovery_tracking_start_address: Optional[int] = None,
         driver_functions: Optional[List[str]] = None,
+        recovery_coverage: Optional["RecoveryCoverageConfig"] = None,
     ) -> None:
         self._driver_functions: Tuple[str, ...] = tuple(driver_functions or ())
         self.mode = mode
@@ -2293,6 +2409,7 @@ class FaultSweepConfig:
             raise ProfileError(
                 "fault_sweep.trace_replay_cross_check_every must be a non-negative integer"
             )
+        self.recovery_coverage = recovery_coverage or RecoveryCoverageConfig()
 
 
 class StateFuzzerConfig:
@@ -3800,6 +3917,19 @@ class ProfileConfig:
                 vars_list.append(
                     "PHASE2_STATE_SEARCH_B64:{}".format(state_search_payload)
                 )
+
+        if fs.recovery_coverage.enabled:
+            cov_runtime = fs.recovery_coverage.to_runtime_dict()
+            cov_payload = base64.b64encode(
+                json.dumps(
+                    cov_runtime,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).decode("ascii")
+            vars_list.append(
+                "RECOVERY_COVERAGE_B64:{}".format(cov_payload)
+            )
 
         if fs.confirm_cycle.enabled:
             vars_list.append("CONFIRM_CYCLE_ENABLED:true")
@@ -5382,9 +5512,41 @@ def _parse_fault_sweep(
             raw.get("driver_functions"),
             "fault_sweep.driver_functions",
         ),
+        recovery_coverage=_parse_fault_sweep_recovery_coverage(
+            raw,
+            bootloader_elf=bootloader_elf,
+            profile_path=profile_path,
+        ),
     )
     fs_cfg._raw_boot_cycle_hook = raw_boot_cycle_hook
     fs_cfg._resolved_boot_cycle_hook = resolved_boot_cycle_hook
+    if fs_cfg.recovery_coverage.enabled:
+        if str(fs_cfg.mode).strip().lower() != "runtime":
+            raise ProfileError(
+                "fault_sweep.recovery_coverage requires fault_sweep.mode runtime"
+            )
+        if str(fs_cfg.evaluation_mode or "execute").strip().lower() == "state":
+            raise ProfileError(
+                "fault_sweep.recovery_coverage requires "
+                "fault_sweep.evaluation_mode execute"
+            )
+    if (
+        fs_cfg.phase2_fault.state_search.order == "coverage_guided"
+        and not fs_cfg.recovery_coverage.enabled
+    ):
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search.order 'coverage_guided' "
+            "requires fault_sweep.recovery_coverage to be enabled"
+        )
+    if (
+        fs_cfg.phase2_fault.state_search.max_boots_without_new_coverage
+        is not None
+        and not fs_cfg.recovery_coverage.enabled
+    ):
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search.max_boots_without_new_coverage "
+            "requires fault_sweep.recovery_coverage to be enabled"
+        )
     if (
         "interrupted_erase" in fs_cfg.phase2_fault.first_fault_types
         and not fs_cfg.include_erase_fault_points
@@ -5634,6 +5796,22 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
             "fault_sweep.phase2_fault.state_search.max_wall_time_s: "
             "expected positive number"
         ) from exc
+    if "max_boots_without_new_coverage" in raw and "plateau_boots" in raw:
+        raise ProfileError(
+            "fault_sweep.phase2_fault.state_search: specify only one of "
+            "max_boots_without_new_coverage or plateau_boots"
+        )
+    raw_plateau = raw.get(
+        "max_boots_without_new_coverage", raw.get("plateau_boots")
+    )
+    max_boots_without_new_coverage: Optional[int] = None
+    if raw_plateau is not None:
+        if isinstance(raw_plateau, bool) or not isinstance(raw_plateau, int):
+            raise ProfileError(
+                "fault_sweep.phase2_fault.state_search.max_boots_without_new_coverage: "
+                "expected positive integer"
+            )
+        max_boots_without_new_coverage = int(raw_plateau)
     return RecoveryStateSearchConfig(
         enabled=_parse_bool(
             raw.get("enabled", False),
@@ -5652,6 +5830,152 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
         cross_check_every=int(raw.get("cross_check_every", 100)),
         shard_count=raw.get("shard_count", 1),
         shard_index=raw.get("shard_index", 0),
+        order=str(raw.get("order", "breadth_first")),
+        max_boots_without_new_coverage=max_boots_without_new_coverage,
+    )
+
+
+def _parse_string_list_field(raw: Any, context: str) -> List[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ProfileError("{}: expected list of strings".format(context))
+    items: List[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise ProfileError(
+                "{}[{}]: expected non-empty string".format(context, index)
+            )
+        text = item.strip()
+        if text not in items:
+            items.append(text)
+    return items
+
+
+def _parse_recovery_coverage(
+    raw: Optional[Dict[str, Any]],
+    *,
+    bootloader_elf: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+    context: str = "fault_sweep.recovery_coverage",
+) -> RecoveryCoverageConfig:
+    if raw is None:
+        return RecoveryCoverageConfig()
+    if not isinstance(raw, dict):
+        raise ProfileError("{}: expected mapping".format(context))
+    _reject_unknown_keys(
+        raw,
+        frozenset(
+            {
+                "enabled",
+                "functions",
+                "source_files",
+                "address_ranges",
+                "mechanism",
+            }
+        ),
+        context,
+    )
+    enabled = _parse_bool(
+        raw.get("enabled", True), "{}.enabled".format(context)
+    )
+    functions = _parse_string_list_field(
+        raw.get("functions"), "{}.functions".format(context)
+    )
+    source_files = _parse_string_list_field(
+        raw.get("source_files"), "{}.source_files".format(context)
+    )
+    address_ranges = _parse_recovery_state_ranges(
+        raw.get("address_ranges", []),
+        "{}.address_ranges".format(context),
+        0xFFFFFFFF,
+    )
+    mechanism = str(raw.get("mechanism", "oneshot_address_hooks"))
+    cfg = RecoveryCoverageConfig(
+        enabled=enabled,
+        functions=functions,
+        source_files=source_files,
+        address_ranges=address_ranges,
+        mechanism=mechanism,
+    )
+    if not cfg.enabled:
+        return cfg
+
+    resolved_elf: Optional[Path] = None
+    if bootloader_elf:
+        if cfg.functions or cfg.source_files:
+            resolved_elf = _resolve_existing_profile_path(
+                bootloader_elf,
+                profile_path=profile_path,
+                ctx="bootloader.elf",
+            )
+        else:
+            candidate = _resolve_profile_input_path(
+                bootloader_elf,
+                profile_path=profile_path,
+            )
+            if candidate.is_file():
+                resolved_elf = candidate
+    elif cfg.functions or cfg.source_files:
+        raise ProfileError(
+            "{}: functions and source_files require bootloader.elf".format(
+                context
+            )
+        )
+
+    repo_root = _LOAD_REPO_ROOT or Path(__file__).resolve().parent.parent
+    try:
+        cfg.scope = build_recovery_coverage_scope(
+            elf_path=str(resolved_elf) if resolved_elf is not None else None,
+            functions=cfg.functions,
+            source_files=cfg.source_files,
+            address_ranges=[
+                {"start": start, "end": end}
+                for start, end in cfg.address_ranges
+            ],
+            mechanism=cfg.mechanism,
+            repo_root=str(repo_root),
+        )
+    except RecoveryCoverageError as exc:
+        raise ProfileError("{}: {}".format(context, exc)) from exc
+    return cfg
+
+
+def _parse_fault_sweep_recovery_coverage(
+    raw_fault_sweep: Dict[str, Any],
+    *,
+    bootloader_elf: Optional[str] = None,
+    profile_path: Optional[Path] = None,
+) -> RecoveryCoverageConfig:
+    top_raw = raw_fault_sweep.get("recovery_coverage")
+    phase2_raw = raw_fault_sweep.get("phase2_fault")
+    state_search_raw = (
+        phase2_raw.get("state_search")
+        if isinstance(phase2_raw, dict)
+        else None
+    )
+    nested_raw = (
+        state_search_raw.get("recovery_coverage")
+        if isinstance(state_search_raw, dict)
+        else None
+    )
+    if top_raw is not None and nested_raw is not None:
+        raise ProfileError(
+            "fault_sweep.recovery_coverage cannot be configured in both "
+            "fault_sweep and fault_sweep.phase2_fault.state_search"
+        )
+    if nested_raw is not None:
+        return _parse_recovery_coverage(
+            nested_raw,
+            bootloader_elf=bootloader_elf,
+            profile_path=profile_path,
+            context="fault_sweep.phase2_fault.state_search.recovery_coverage",
+        )
+    return _parse_recovery_coverage(
+        top_raw,
+        bootloader_elf=bootloader_elf,
+        profile_path=profile_path,
+        context="fault_sweep.recovery_coverage",
     )
 
 
@@ -8523,6 +8847,7 @@ _STRICT_FAULT_SWEEP_KEYS = frozenset(
         "include_erase_fault_points",
         "trace_replay_cross_check_every",
         "driver_functions",
+        "recovery_coverage",
     }
 )
 
@@ -8851,6 +9176,10 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 "symbols", "return_value", "return_register", "require_applied",
                 "severity_model",
             },
+            "recovery_coverage": {
+                "enabled", "functions", "source_files", "address_ranges",
+                "mechanism",
+            },
         }
         for field_name, allowed in nested_fault_schemas.items():
             nested = fault_sweep.get(field_name)
@@ -8872,6 +9201,8 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                         "enabled", "plan_only", "first_cuts", "max_cuts", "max_new_states",
                         "max_wall_time_s", "address_ranges", "cross_check_every",
                         "shard_count", "shard_index",
+                        "order", "max_boots_without_new_coverage",
+                        "plateau_boots", "recovery_coverage",
                     }
                 ),
                 "fault_sweep.phase2_fault.state_search",
@@ -8882,6 +9213,21 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                     first_cuts,
                     frozenset({"mode", "ranges"}),
                     "fault_sweep.phase2_fault.state_search.first_cuts",
+                )
+            nested_cov = state_search.get("recovery_coverage")
+            if nested_cov is not None:
+                _reject_unknown_keys(
+                    nested_cov,
+                    frozenset(
+                        {
+                            "enabled",
+                            "functions",
+                            "source_files",
+                            "address_ranges",
+                            "mechanism",
+                        }
+                    ),
+                    "fault_sweep.phase2_fault.state_search.recovery_coverage",
                 )
 
         probes = fault_sweep.get("verification_probes") or []
