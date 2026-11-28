@@ -1886,7 +1886,9 @@ def _detect_reset_family(platform_path):
     if not platform_path:
         return None
     stem = os.path.splitext(os.path.basename(str(platform_path).strip()))[0]
-    return _RESET_DOMAIN_FAMILIES.get(stem)
+    if not stem:
+        return None
+    return _RESET_DOMAIN_FAMILIES.get(stem, 'generic')
 
 
 reset_family = _detect_reset_family(platform_repl_path)
@@ -1894,6 +1896,59 @@ power_domain = None
 _next_reset_kind = 'power_on'
 _current_boot_reset_kind = 'power_on'
 _trial_boot_reset_kinds = []
+
+
+def _enable_released_cpu_time_handles():
+    """Re-enable TimeHandle.Enabled on every unhalted CPU after reset or unhalt.
+
+    When a CPU is halted mid-quantum while its execution thread is active (for
+    example inside a memory-access hook, block hook, interrupt hook, NVIC lockup,
+    or watchdog), BaseCPU disables TimeHandle.Enabled on thread exit. A later
+    paused machine Reset sets IsHalted = false (which sets DeferredEnabled = true
+    without re-enabling TimeHandle.Enabled), causing the CPU to miss the first
+    synchronization quantum of the next RunFor while peripheral timers advance.
+    """
+    mon = globals().get('monitor')
+    machine = getattr(mon, 'Machine', None) if mon is not None else None
+    if machine is None:
+        return 0
+    enabled_count = 0
+    seen = []
+    candidates = []
+    for sysbus_candidate in (
+        getattr(machine, 'SystemBus', None),
+        globals().get('bus'),
+    ):
+        try:
+            if sysbus_candidate is not None and hasattr(sysbus_candidate, 'GetCPUs'):
+                for cpu_obj in sysbus_candidate.GetCPUs():
+                    if cpu_obj is not None:
+                        candidates.append(cpu_obj)
+        except Exception:
+            pass
+    if isinstance(machine, dict):
+        for cpu_obj in machine.values():
+            if cpu_obj is not None and hasattr(cpu_obj, 'TimeHandle'):
+                candidates.append(cpu_obj)
+    try:
+        primary_cpu = machine['sysbus.cpu']
+        if primary_cpu is not None:
+            candidates.append(primary_cpu)
+    except Exception:
+        pass
+    for cpu_obj in candidates:
+        if any(existing is cpu_obj or existing == cpu_obj for existing in seen):
+            continue
+        seen.append(cpu_obj)
+        try:
+            if not bool(getattr(cpu_obj, 'IsHalted', False)):
+                th = getattr(cpu_obj, 'TimeHandle', None)
+                if th is not None:
+                    th.Enabled = True
+                    enabled_count += 1
+        except Exception:
+            pass
+    return enabled_count
 
 
 def _ensure_power_reset_domain():
@@ -1988,10 +2043,16 @@ def _after_machine_reset():
             dom.EndPowerLoss()
         except Exception as exc:
             log('WARNING: powerDomain post-reset hook failed: {}'.format(exc))
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     history = list(globals().get('_trial_boot_reset_kinds') or ())
     history.append(reset_kind)
     _trial_boot_reset_kinds = history
     _next_reset_kind = 'power_loss'
+    _sync_role_rk_fn = globals().get('_sync_boot_role_reset_kind')
+    if callable(_sync_role_rk_fn):
+        _sync_role_rk_fn(reset_kind)
 
 
 _ensure_power_reset_domain()
@@ -2686,6 +2747,8 @@ if update_sequence_enabled:
 
 # Setup script.
 setup_script = str(monitor.GetVariable('setup_script')).strip()
+if setup_script:
+    enable_machine_snapshots = False
 boundary_setup_env = get_optional_var('boundary_setup_env', '')
 boundary_value_raw = get_optional_var('boundary_value', '')
 boundary_durable_state_file = get_optional_var('boundary_durable_state_file', '')
@@ -5152,12 +5215,338 @@ def _runtime_slot_geometry():
     return geometry
 
 
+_FAULT_NAME_TO_CODE = {
+    'power_loss': 'w',
+    'interrupted_erase': 'e',
+    'multi_sector_atomicity': 'a',
+    'bit_corruption': 'b',
+    'silent_write_failure': 's',
+    'driver_error': 'g',
+    'rc_injection': 'x',
+    'write_disturb': 'd',
+    'wear_leveling_corruption': 'l',
+    'write_rejection': 'r',
+    'reset_at_time': 't',
+    'read_bit_flip': 'f',
+    'command_drop': 'k',
+    'hook_fault': 'h',
+    'confirm_cycle': 'cc',
+}
+
+_current_boot_role = {
+    'phase': 'first_operation',
+    'generation': 0,
+    'source': 'live_injection',
+    'is_computed_source': False,
+    'is_live_injection': True,
+    'preceding_cut': None,
+    'preceding_cuts': [],
+    'cut': None,
+    'reset_kind': 'power_on',
+    'cycle': 0,
+}
+
+
+def _build_boot_role_cut(cut_info, cut_ordinal=1):
+    if cut_info is None:
+        return None
+    if not isinstance(cut_info, dict):
+        return None
+    name_map = globals().get('_FAULT_NAME_TO_CODE') or _FAULT_NAME_TO_CODE
+    code_map = globals().get('_FAULT_CODE_TO_NAME') or dict(
+        (v, k) for k, v in name_map.items()
+    )
+    raw_op = cut_info.get('operation')
+    raw_ft = str(cut_info.get('fault_type') or 'power_loss').strip()
+    raw_code = str(cut_info.get('fault_code') or '').strip()
+    if not raw_code:
+        if raw_ft in code_map:
+            raw_code = raw_ft
+            raw_ft = code_map[raw_code]
+        else:
+            raw_code = name_map.get(raw_ft, 'e' if raw_op == 'erase' else 'w')
+    elif raw_ft in code_map:
+        raw_ft = code_map[raw_ft]
+    if not raw_op:
+        base_fn = globals().get('_base_fault_type_code')
+        base_c = base_fn(raw_code) if callable(base_fn) else str(raw_code).split(':', 1)[0]
+        if base_c in ('e', 'a'):
+            raw_op = 'erase'
+        elif base_c == 'k':
+            raw_op = 'command'
+        elif base_c in (globals().get('_I2C_WIRE_CODE_TO_FAULT_TYPE') or {}):
+            raw_op = 'i2c'
+        elif base_c in (globals().get('_OTP_WIRE_CODES') or ()):
+            raw_op = 'otp'
+        elif base_c == 't':
+            raw_op = 'time'
+        elif base_c == 'h':
+            raw_op = 'hook'
+        elif base_c == 'cc':
+            raw_op = 'confirm'
+        else:
+            raw_op = 'write'
+    op_idx = cut_info.get('operation_index')
+    if op_idx is None:
+        op_idx = cut_info.get('fault_at', 0)
+    op_idx = int(op_idx)
+    raw_addr = cut_info.get('address')
+    if raw_addr is None:
+        raw_addr = cut_info.get('fault_address', 0)
+    fmt_fn = globals().get('fmt_u32') or (lambda v: '0x{:08X}'.format(int(v) & 0xFFFFFFFF))
+    as_int_fn = globals().get('as_int') or int
+    if isinstance(raw_addr, str) and raw_addr.strip():
+        try:
+            addr_str = fmt_fn(int(raw_addr, 0))
+        except Exception:
+            addr_str = raw_addr.strip()
+    else:
+        addr_str = fmt_fn(as_int_fn(raw_addr))
+    ordinal = int(cut_info.get('cut', cut_ordinal) or cut_ordinal)
+    entry = {
+        'cut': ordinal,
+        'cut_index': ordinal - 1,
+        'operation': str(raw_op),
+        'operation_index': op_idx,
+        'fault_at': op_idx,
+        'fault_type': str(raw_ft),
+        'fault_code': str(raw_code),
+        'address': addr_str,
+    }
+    for opt_key, src_key in (
+        ('pc', 'pc'),
+        ('pc', 'fault_pc'),
+        ('call_context', 'call_context'),
+        ('call_context', 'fault_call_context'),
+        ('torn_word', 'torn_word'),
+        ('mram_torn_word', 'mram_torn_word'),
+        ('text', 'text'),
+    ):
+        val = cut_info.get(src_key)
+        if val is not None and val != '' and opt_key not in entry:
+            entry[opt_key] = val
+    return entry
+
+
+def _copy_boot_role(role=None):
+    src = globals().get('_current_boot_role') if role is None else role
+    if not isinstance(src, dict):
+        src = {
+            'phase': 'first_operation',
+            'generation': 0,
+            'source': 'live_injection',
+            'is_computed_source': False,
+            'is_live_injection': True,
+            'preceding_cut': None,
+            'preceding_cuts': [],
+            'cut': None,
+            'reset_kind': str(globals().get('_current_boot_reset_kind') or 'power_on'),
+            'cycle': 0,
+        }
+    copied = dict(src)
+    if isinstance(src.get('preceding_cut'), dict):
+        copied['preceding_cut'] = dict(src['preceding_cut'])
+        copied['cut'] = dict(src['preceding_cut'])
+    else:
+        copied['preceding_cut'] = None
+        copied['cut'] = None
+    copied['preceding_cuts'] = [
+        dict(item)
+        for item in (src.get('preceding_cuts') or ())
+        if isinstance(item, dict)
+    ]
+    return copied
+
+
+def get_boot_role():
+    return _copy_boot_role(globals().get('_current_boot_role'))
+
+
+def _sync_boot_role_globals(role=None):
+    active = _copy_boot_role(role)
+    g = globals()
+    g['boot_role'] = active
+    g['boot_phase'] = active['phase']
+    g['boot_generation'] = int(active['generation'])
+    g['boot_source'] = active['source']
+    g['boot_is_computed_source'] = bool(active['is_computed_source'])
+    g['boot_is_live_injection'] = bool(active['is_live_injection'])
+    g['boot_preceding_cut'] = active['preceding_cut']
+    g['boot_preceding_cuts'] = active['preceding_cuts']
+    g['boot_cut'] = active['preceding_cut']
+    g['boot_reset_kind'] = active['reset_kind']
+    g['boot_cycle'] = int(active['cycle'])
+    return active
+
+
+def _sync_boot_role_reset_kind(reset_kind=None):
+    global _current_boot_role
+    rk = str(reset_kind or globals().get('_current_boot_reset_kind') or 'power_on')
+    cur = globals().get('_current_boot_role')
+    if isinstance(cur, dict):
+        cur['reset_kind'] = rk
+        _sync_boot_role_globals(cur)
+
+
+def _set_boot_role(
+    phase='first_operation',
+    generation=0,
+    source='live_injection',
+    preceding_cut=None,
+    preceding_cuts=None,
+    reset_kind=None,
+    cycle=0,
+):
+    global _current_boot_role
+    norm_phase = str(
+        phase or ('recovery' if int(generation or 0) > 0 else 'first_operation')
+    ).strip()
+    if norm_phase not in ('first_operation', 'recovery'):
+        norm_phase = 'recovery' if int(generation or 0) > 0 else 'first_operation'
+    norm_gen = max(0, int(generation or (1 if norm_phase == 'recovery' else 0)))
+    if norm_phase == 'first_operation':
+        norm_gen = 0
+    elif norm_gen == 0:
+        norm_gen = 1
+    norm_source = str(source or 'live_injection').strip()
+    if norm_source not in ('computed_source', 'live_injection'):
+        norm_source = (
+            'computed_source'
+            if norm_source in ('computed', 'replay', 'state_search')
+            else 'live_injection'
+        )
+    cuts_list = []
+    if preceding_cuts:
+        for idx, item in enumerate(preceding_cuts, start=1):
+            built = _build_boot_role_cut(item, cut_ordinal=idx)
+            if built is not None:
+                cuts_list.append(built)
+    if preceding_cut is not None:
+        built_last = _build_boot_role_cut(preceding_cut, cut_ordinal=max(1, norm_gen))
+        if not cuts_list:
+            cuts_list = [built_last] if built_last is not None else []
+        elif built_last is not None:
+            cuts_list[-1] = built_last
+    else:
+        built_last = cuts_list[-1] if cuts_list else None
+    if norm_phase == 'first_operation':
+        built_last = None
+        cuts_list = []
+    if reset_kind is None:
+        if int(cycle or 0) > 0:
+            norm_reset_kind = 'warm'
+        elif norm_phase == 'recovery':
+            norm_reset_kind = str(
+                globals().get('_next_reset_kind')
+                or globals().get('_current_boot_reset_kind')
+                or 'power_loss'
+            )
+        else:
+            norm_reset_kind = 'power_on'
+    else:
+        norm_reset_kind = str(reset_kind)
+    role = {
+        'phase': norm_phase,
+        'generation': norm_gen,
+        'source': norm_source,
+        'is_computed_source': bool(norm_source == 'computed_source'),
+        'is_live_injection': bool(norm_source == 'live_injection'),
+        'preceding_cut': dict(built_last) if isinstance(built_last, dict) else None,
+        'preceding_cuts': [dict(c) for c in cuts_list],
+        'cut': dict(built_last) if isinstance(built_last, dict) else None,
+        'reset_kind': norm_reset_kind,
+        'cycle': max(0, int(cycle or 0)),
+    }
+    _current_boot_role = role
+    return _sync_boot_role_globals(role)
+
+
+def _export_boot_role_to_monitor(role=None):
+    active = _sync_boot_role_globals(role)
+    set_var = globals().get('_set_monitor_hook_var')
+    if callable(set_var) and globals().get('monitor') is not None:
+        try:
+            set_var('boot_phase', active['phase'])
+            set_var('boot_generation', int(active['generation']))
+            set_var('boot_source', active['source'])
+            set_var('boot_is_computed_source', bool(active['is_computed_source']))
+            set_var('boot_is_live_injection', bool(active['is_live_injection']))
+            set_var('boot_reset_kind', active['reset_kind'])
+            set_var('boot_cycle', int(active['cycle']))
+            cut = active.get('preceding_cut')
+            cuts_all = active.get('preceding_cuts') or []
+            set_var('boot_preceding_cuts_json', json.dumps(cuts_all, sort_keys=True))
+            if isinstance(cut, dict):
+                cut_json = json.dumps(cut, sort_keys=True)
+                set_var('boot_preceding_cut', cut_json)
+                set_var('boot_preceding_cut_json', cut_json)
+                set_var('boot_preceding_cut_operation', cut.get('operation'))
+                set_var('boot_cut_operation', cut.get('operation'))
+                set_var('boot_preceding_cut_index', int(cut.get('operation_index', 0)))
+                set_var('boot_cut_index', int(cut.get('operation_index', 0)))
+                set_var('boot_preceding_cut_fault_type', cut.get('fault_type'))
+                set_var('boot_cut_fault_type', cut.get('fault_type'))
+                set_var('boot_preceding_cut_address', cut.get('address'))
+                set_var('boot_cut_address', cut.get('address'))
+            else:
+                set_var('boot_preceding_cut', None)
+                set_var('boot_preceding_cut_json', None)
+                set_var('boot_preceding_cut_operation', None)
+                set_var('boot_cut_operation', None)
+                set_var('boot_preceding_cut_index', -1)
+                set_var('boot_cut_index', -1)
+                set_var('boot_preceding_cut_fault_type', None)
+                set_var('boot_cut_fault_type', None)
+                set_var('boot_preceding_cut_address', None)
+                set_var('boot_cut_address', None)
+        except Exception:
+            pass
+    return active
+
+
+def _enrich_context_with_boot_role(context):
+    probe_context = dict(context) if isinstance(context, dict) else {}
+    role = _copy_boot_role(probe_context.get('boot_role'))
+    if 'cycle' in probe_context and probe_context.get('cycle') is not None:
+        try:
+            role['cycle'] = int(probe_context['cycle'])
+        except Exception:
+            pass
+    if 'reset_kind' in probe_context and probe_context.get('reset_kind'):
+        role['reset_kind'] = str(probe_context['reset_kind'])
+    probe_context['boot_role'] = _copy_boot_role(role)
+    probe_context.setdefault('phase', role['phase'])
+    probe_context.setdefault('boot_phase', role['phase'])
+    probe_context.setdefault('generation', int(role['generation']))
+    probe_context.setdefault('boot_generation', int(role['generation']))
+    probe_context.setdefault('source', role['source'])
+    probe_context.setdefault('boot_source', role['source'])
+    probe_context.setdefault('is_computed_source', bool(role['is_computed_source']))
+    probe_context.setdefault('is_live_injection', bool(role['is_live_injection']))
+    probe_context.setdefault('preceding_cut', role['preceding_cut'])
+    probe_context.setdefault('preceding_cuts', role['preceding_cuts'])
+    probe_context.setdefault('cut', role['preceding_cut'])
+    probe_context.setdefault('reset_kind', role['reset_kind'])
+    probe_context.setdefault('boot_reset_kind', role['reset_kind'])
+    probe_context.setdefault('cycle', int(role['cycle']))
+    if role['phase'] == 'recovery' and int(role['generation']) > 0:
+        probe_context.setdefault('recovery_state_generation', int(role['generation']))
+        probe_context.setdefault('phase2_cut', int(role['generation']))
+    return probe_context
+
+
+_sync_boot_role_globals(_current_boot_role)
+
+
 def collect_semantic_state(context):
     collect_fn = load_state_probe()
     if collect_fn is None:
         return None
     probe_context = dict(context) if isinstance(context, dict) else {}
     probe_context.setdefault('slot_geometry', _runtime_slot_geometry())
+    _enrich_fn = globals().get('_enrich_context_with_boot_role')
+    if callable(_enrich_fn):
+        probe_context = _enrich_fn(probe_context)
     try:
         state = collect_fn(bus=bus, monitor=monitor, context=probe_context)
     except TypeError:
@@ -5183,6 +5572,12 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
         'signals': dict(signals) if isinstance(signals, dict) else {},
     }
     record['signals'].setdefault('reset_kind', _cycle_reset_kind)
+    _get_role_fn = globals().get('get_boot_role')
+    if callable(_get_role_fn):
+        _cycle_role = _get_role_fn()
+        _cycle_role['cycle'] = int(cycle_index)
+        _cycle_role['reset_kind'] = _cycle_reset_kind
+        record['boot_role'] = _cycle_role
     if stop_status is not None:
         record['stop_reason'] = stop_status.get('reason')
         record['emulated_s'] = stop_status.get('emulated_s')
@@ -5206,6 +5601,7 @@ def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_statu
         'signals': record['signals'],
         'fault_injected': bool(fault_injected),
         'stage': 'boot_cycle',
+        'reset_kind': _cycle_reset_kind,
     })
     if semantic_state is not None:
         record['semantic_state'] = semantic_state
@@ -5308,6 +5704,8 @@ def run_boot_cycle_hook(next_cycle_index, cycle_records):
     _set_monitor_hook_var('boot_cycle_previous_index', int(next_cycle_index) - 1)
     _set_monitor_hook_var('boot_cycle_previous_slot', previous_record.get('boot_slot'))
     _set_monitor_hook_var('boot_cycle_previous_outcome', previous_record.get('boot_outcome'))
+    _export_role_fn = globals().get('_export_boot_role_to_monitor')
+    active_role = _export_role_fn() if callable(_export_role_fn) else None
     if hook_path.lower().endswith('.py'):
         hook_globals = {
             '__name__': '__tardigrade_boot_cycle_hook__',
@@ -5319,6 +5717,20 @@ def run_boot_cycle_hook(next_cycle_index, cycle_records):
             'next_cycle_index': int(next_cycle_index),
             'success_vtor_slot': success_vtor_slot,
         }
+        if isinstance(active_role, dict):
+            hook_globals.update({
+                'boot_role': active_role,
+                'boot_phase': active_role.get('phase'),
+                'boot_generation': active_role.get('generation'),
+                'boot_source': active_role.get('source'),
+                'boot_is_computed_source': active_role.get('is_computed_source'),
+                'boot_is_live_injection': active_role.get('is_live_injection'),
+                'boot_preceding_cut': active_role.get('preceding_cut'),
+                'boot_preceding_cuts': active_role.get('preceding_cuts'),
+                'boot_cut': active_role.get('preceding_cut'),
+                'boot_reset_kind': active_role.get('reset_kind'),
+                'boot_cycle': active_role.get('cycle'),
+            })
         with open(hook_path, 'r') as hook_file:
             source = hook_file.read()
         exec(compile(source, hook_path, 'exec'), hook_globals, hook_globals)
@@ -5411,6 +5823,8 @@ def run_boot_cycle_hook_fault(next_cycle_index, cycle_records, hook_fault_at, ho
     _set_monitor_hook_var('boot_cycle_previous_index', int(next_cycle_index) - 1)
     _set_monitor_hook_var('boot_cycle_previous_slot', previous_record.get('boot_slot'))
     _set_monitor_hook_var('boot_cycle_previous_outcome', previous_record.get('boot_outcome'))
+    _export_role_fn = globals().get('_export_boot_role_to_monitor')
+    active_role = _export_role_fn() if callable(_export_role_fn) else None
     hook_bus = _FaultInjectingHookBus(bus, hook_fault_at, hook_fault_type)
     hook_globals = {
         '__name__': '__tardigrade_boot_cycle_hook__',
@@ -5422,6 +5836,20 @@ def run_boot_cycle_hook_fault(next_cycle_index, cycle_records, hook_fault_at, ho
         'next_cycle_index': int(next_cycle_index),
         'success_vtor_slot': success_vtor_slot,
     }
+    if isinstance(active_role, dict):
+        hook_globals.update({
+            'boot_role': active_role,
+            'boot_phase': active_role.get('phase'),
+            'boot_generation': active_role.get('generation'),
+            'boot_source': active_role.get('source'),
+            'boot_is_computed_source': active_role.get('is_computed_source'),
+            'boot_is_live_injection': active_role.get('is_live_injection'),
+            'boot_preceding_cut': active_role.get('preceding_cut'),
+            'boot_preceding_cuts': active_role.get('preceding_cuts'),
+            'boot_cut': active_role.get('preceding_cut'),
+            'boot_reset_kind': active_role.get('reset_kind'),
+            'boot_cycle': active_role.get('cycle'),
+        })
     with open(hook_path, 'r') as hook_file:
         source = hook_file.read()
     try:
@@ -5675,38 +6103,65 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
     else:
         flash_size = int(b['data'].FlashSize)
 
-    for cycle_index in range(int(start_cycle_index), int(boot_cycles)):
-        run_boot_cycle_hook(cycle_index, cycle_records)
-        followup_uncorr = (
-            _snapshot_mram_uncorrectable_offsets()
-            if (b['kind'] in ('mram', 'slow') or _mram_uncorrectable_target() is not None)
-            else []
-        )
-        if b['kind'] == 'mram':
-            current_flash = b['data'].ReadBytes(0, flash_size)
-        else:
-            current_flash = b['data'].Flash.ReadBytes(0, flash_size)
-        _set_kind_fn = globals().get('_set_next_reset_kind')
-        if callable(_set_kind_fn):
-            _set_kind_fn('warm')
-        restore_flash_and_boot(current_flash)
-        if followup_uncorr:
-            _restore_mram_uncorrectable_offsets(followup_uncorr)
-        if _hash_bypass_active:
-            apply_hash_bypass()
-        cycle_record = _boot_followup_cycle(
-            cycle_index,
-            fault_injected,
-            label,
-            effective_criteria=effective_criteria,
-            wall_timeout=cycle_wall_timeout,
-        )
-        cycle_records.append(cycle_record)
-        if (
-            cycle_record.get('infrastructure_error')
-            or cycle_record.get('boot_outcome') == 'infra_error'
-        ):
-            break
+    _get_role_fn = globals().get('get_boot_role')
+    _set_role_fn = globals().get('_set_boot_role')
+    _saved_role = _get_role_fn() if callable(_get_role_fn) else None
+
+    try:
+        for cycle_index in range(int(start_cycle_index), int(boot_cycles)):
+            if callable(_set_role_fn) and isinstance(_saved_role, dict):
+                _set_role_fn(
+                    phase=_saved_role.get('phase', 'recovery' if fault_injected else 'first_operation'),
+                    generation=_saved_role.get('generation', 1 if fault_injected else 0),
+                    source=_saved_role.get('source', 'live_injection'),
+                    preceding_cut=_saved_role.get('preceding_cut'),
+                    preceding_cuts=_saved_role.get('preceding_cuts'),
+                    reset_kind='warm',
+                    cycle=int(cycle_index),
+                )
+            run_boot_cycle_hook(cycle_index, cycle_records)
+            followup_uncorr = (
+                _snapshot_mram_uncorrectable_offsets()
+                if (b['kind'] in ('mram', 'slow') or _mram_uncorrectable_target() is not None)
+                else []
+            )
+            if b['kind'] == 'mram':
+                current_flash = b['data'].ReadBytes(0, flash_size)
+            else:
+                current_flash = b['data'].Flash.ReadBytes(0, flash_size)
+            _set_kind_fn = globals().get('_set_next_reset_kind')
+            if callable(_set_kind_fn):
+                _set_kind_fn('warm')
+            globals()['_pending_recovery_uncorrectable_offsets'] = list(followup_uncorr)
+            restore_flash_and_boot(current_flash)
+            if followup_uncorr:
+                _restore_mram_uncorrectable_offsets(followup_uncorr)
+            if _hash_bypass_active:
+                apply_hash_bypass()
+            cycle_record = _boot_followup_cycle(
+                cycle_index,
+                fault_injected,
+                label,
+                effective_criteria=effective_criteria,
+                wall_timeout=cycle_wall_timeout,
+            )
+            cycle_records.append(cycle_record)
+            if (
+                cycle_record.get('infrastructure_error')
+                or cycle_record.get('boot_outcome') == 'infra_error'
+            ):
+                break
+    finally:
+        if callable(_set_role_fn) and isinstance(_saved_role, dict):
+            _set_role_fn(
+                phase=_saved_role.get('phase', 'first_operation'),
+                generation=_saved_role.get('generation', 0),
+                source=_saved_role.get('source', 'live_injection'),
+                preceding_cut=_saved_role.get('preceding_cut'),
+                preceding_cuts=_saved_role.get('preceding_cuts'),
+                reset_kind=_saved_role.get('reset_kind', 'power_loss'),
+                cycle=_saved_role.get('cycle', 0),
+            )
 
     followup_ms = int((_time.time() - followup_t0) * 1000)
     return cycle_records, analyze_boot_cycles(cycle_records), followup_ms
@@ -5857,9 +6312,29 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
 
     current_flash = _snapshot_current_flash()
     phase2_t0 = _time.time()
+    _hook_reset_kind = 'power_loss' if hook_fault_type == 'w' else 'warm'
     _set_kind_fn = globals().get('_set_next_reset_kind')
     if callable(_set_kind_fn):
-        _set_kind_fn('power_loss' if hook_fault_type == 'w' else 'warm')
+        _set_kind_fn(_hook_reset_kind)
+    _set_role_fn = globals().get('_set_boot_role')
+    if callable(_set_role_fn):
+        _hook_cut = {
+            'cut': 1,
+            'operation': 'hook',
+            'operation_index': int(hook_fault_at),
+            'fault_code': 'h:{}'.format(hook_fault_type),
+            'fault_type': 'hook_fault',
+            'address': int(hook_meta.get('fault_address', 0)),
+        }
+        _set_role_fn(
+            phase='recovery',
+            generation=1,
+            source='live_injection',
+            preceding_cut=_hook_cut,
+            preceding_cuts=[_hook_cut],
+            reset_kind=_hook_reset_kind,
+            cycle=1,
+        )
     restore_flash_and_boot(current_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -6137,6 +6612,8 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
             _set_monitor_hook_var('boot_cycle_previous_index', 0)
             _set_monitor_hook_var('boot_cycle_previous_slot', boot_slot0)
             _set_monitor_hook_var('boot_cycle_previous_outcome', boot_outcome0)
+            _export_role_fn = globals().get('_export_boot_role_to_monitor')
+            active_role = _export_role_fn() if callable(_export_role_fn) else None
             hook_globals = {
                 '__name__': '__tardigrade_boot_cycle_hook__',
                 '__file__': hook_path,
@@ -6149,6 +6626,20 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
                 'confirm_function_address': confirm_addr,
                 'confirm_function_name': _confirm_cycle_function,
             }
+            if isinstance(active_role, dict):
+                hook_globals.update({
+                    'boot_role': active_role,
+                    'boot_phase': active_role.get('phase'),
+                    'boot_generation': active_role.get('generation'),
+                    'boot_source': active_role.get('source'),
+                    'boot_is_computed_source': active_role.get('is_computed_source'),
+                    'boot_is_live_injection': active_role.get('is_live_injection'),
+                    'boot_preceding_cut': active_role.get('preceding_cut'),
+                    'boot_preceding_cuts': active_role.get('preceding_cuts'),
+                    'boot_cut': active_role.get('preceding_cut'),
+                    'boot_reset_kind': active_role.get('reset_kind'),
+                    'boot_cycle': active_role.get('cycle'),
+                })
             with open(hook_path, 'r') as hook_file:
                 source = hook_file.read()
             try:
@@ -6174,9 +6665,29 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
     # Phase 3: Reboot and evaluate.
     current_flash = _snapshot_current_flash()
     phase3_t0 = _time.time()
+    _cc_reset_kind = 'power_loss' if cc_fault_type == 'w' else 'warm'
     _set_kind_fn = globals().get('_set_next_reset_kind')
     if callable(_set_kind_fn):
-        _set_kind_fn('power_loss' if cc_fault_type == 'w' else 'warm')
+        _set_kind_fn(_cc_reset_kind)
+    _set_role_fn = globals().get('_set_boot_role')
+    if callable(_set_role_fn):
+        _cc_cut = {
+            'cut': 1,
+            'operation': 'confirm',
+            'operation_index': int(cc_fault_at),
+            'fault_code': 'cc:{}'.format(cc_fault_type),
+            'fault_type': 'confirm_cycle',
+            'address': int(hook_bus.fault_address),
+        }
+        _set_role_fn(
+            phase='recovery',
+            generation=1,
+            source='live_injection',
+            preceding_cut=_cc_cut,
+            preceding_cuts=[_cc_cut],
+            reset_kind=_cc_reset_kind,
+            cycle=1,
+        )
     restore_flash_and_boot(current_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -7860,8 +8371,15 @@ def prime_bootloader_entry():
             prime_method = 'halted_erased_vector_lockup'
         try:
             cpu_ref.IsHalted = bool(zero_vector_guard or erased_vector_lockup)
+            if not bool(zero_vector_guard or erased_vector_lockup):
+                _th = getattr(cpu_ref, 'TimeHandle', None)
+                if _th is not None:
+                    _th.Enabled = True
         except Exception:
             pass
+        _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+        if callable(_enable_th_fn):
+            _enable_th_fn()
         try:
             log('prime_boot: entry={} sp={} pc={} cpu_pc={} cpu_sp={} vtor={} method={}'.format(
                 fmt_u32(int(bootloader_entry)),
@@ -7884,10 +8402,24 @@ def apply_pre_boot_state():
         raise RuntimeError(
             'boundary follow-up cannot apply baseline pre_boot_state after candidate restore'
         )
+    _set_role_fn = globals().get('_set_boot_role')
+    if callable(_set_role_fn):
+        _set_role_fn(
+            phase='first_operation',
+            generation=0,
+            source=globals().get('_active_phase1_boot_source', 'live_injection'),
+            preceding_cut=None,
+            preceding_cuts=(),
+            reset_kind=str(globals().get('_current_boot_reset_kind') or 'power_on'),
+            cycle=0,
+        )
     apply_boundary_setup_environment()
     if boundary_phase.strip().lower() == 'follow_up':
         restore_boundary_persistent_snapshot(boundary_durable_state_file)
     if setup_script:
+        _export_role_fn = globals().get('_export_boot_role_to_monitor')
+        if callable(_export_role_fn):
+            _export_role_fn()
         monitor.Parse('include @' + setup_script)
     if pre_boot_bin:
         with open(pre_boot_bin, 'rb') as f:
@@ -8267,6 +8799,9 @@ def load_machine_snapshot(path):
     monitor.Parse('Load @{}'.format(path))
     monitor.Parse('mach set {}'.format(_machine_selector))
     refresh_runtime_handles()
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
 
 
 def restore_initial_flash_cache():
@@ -8311,6 +8846,17 @@ def prepare_clean_phase1_state():
     global _last_phase1_setup_detail
     _setup_started = _time.time()
     _reset_started = _time.time()
+    _set_role_fn = globals().get('_set_boot_role')
+    if callable(_set_role_fn):
+        _set_role_fn(
+            phase='first_operation',
+            generation=0,
+            source=globals().get('_active_phase1_boot_source', 'live_injection'),
+            preceding_cut=None,
+            preceding_cuts=(),
+            reset_kind='power_on',
+            cycle=0,
+        )
     _reset_hist_fn = globals().get('_reset_trial_boot_history')
     if callable(_reset_hist_fn):
         _reset_hist_fn('power_on')
@@ -8358,9 +8904,20 @@ def prepare_clean_phase1_state():
 def restore_phase1_baseline():
     global _cached_phase1_snapshot_path, _last_phase1_setup_detail
     _baseline_started = _time.time()
+    _set_role_fn = globals().get('_set_boot_role')
     if update_sequence_enabled:
         ensure_update_sequence_fault_baseline()
         _apply_phase_context(update_sequence_fault_phase)
+        if callable(_set_role_fn):
+            _set_role_fn(
+                phase='first_operation',
+                generation=0,
+                source='live_injection',
+                preceding_cut=None,
+                preceding_cuts=(),
+                reset_kind='warm',
+                cycle=0,
+            )
         _reset_hist_fn = globals().get('_reset_trial_boot_history')
         if callable(_reset_hist_fn):
             _reset_hist_fn('warm')
@@ -8394,6 +8951,16 @@ def restore_phase1_baseline():
     globals()['_trial_boot_reset_kinds'] = ['power_on']
     globals()['_current_boot_reset_kind'] = 'power_on'
     globals()['_next_reset_kind'] = 'power_loss'
+    if callable(_set_role_fn):
+        _set_role_fn(
+            phase='first_operation',
+            generation=0,
+            source='live_injection',
+            preceding_cut=None,
+            preceding_cuts=(),
+            reset_kind='power_on',
+            cycle=0,
+        )
     _last_phase1_setup_detail = {
         'mode': 'machine_snapshot_load',
         'snapshot_load_s': round(
@@ -8478,6 +9045,15 @@ def restore_flash_and_boot(saved_flash):
         else:
             _snapshot_load_started = _time.time()
             load_machine_snapshot(_cached_recovery_snapshot_path)
+            _snap_reset_kind = str(globals().get('_next_reset_kind') or 'power_loss')
+            globals()['_current_boot_reset_kind'] = _snap_reset_kind
+            _snap_hist = list(globals().get('_trial_boot_reset_kinds') or ())
+            _snap_hist.append(_snap_reset_kind)
+            globals()['_trial_boot_reset_kinds'] = _snap_hist
+            globals()['_next_reset_kind'] = 'power_loss'
+            _sync_role_rk_fn = globals().get('_sync_boot_role_reset_kind')
+            if callable(_sync_role_rk_fn):
+                _sync_role_rk_fn(_snap_reset_kind)
             _verify_recovery_marker_cleared()
             _last_recovery_setup_detail = {
                 'shell_mode': 'machine_snapshot_load',
@@ -8505,6 +9081,42 @@ def restore_flash_and_boot(saved_flash):
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
     _flash_overlay_s = max(0.0, _time.time() - _flash_overlay_started)
+    _pending_otp = globals().pop('_pending_recovery_otp_snapshot', None)
+    if _pending_otp is not None:
+        _otp_dev = b.get('otp')
+        if _otp_dev is not None and hasattr(_otp_dev, 'TestRestore'):
+            _otp_dev.TestRestore(_pending_otp)
+    _pending_uncorr = globals().pop('_pending_recovery_uncorrectable_offsets', None)
+    if _pending_uncorr is not None:
+        _clear_uncorr_fn = globals().get('_clear_mram_uncorrectable_words')
+        if callable(_clear_uncorr_fn):
+            _clear_uncorr_fn()
+        if _pending_uncorr:
+            _restore_uncorr_fn = globals().get('_restore_mram_uncorrectable_offsets')
+            if callable(_restore_uncorr_fn):
+                _restore_uncorr_fn(_pending_uncorr)
+    _cur_role_fn = globals().get('get_boot_role')
+    _cur_phase = (
+        (_cur_role_fn().get('phase') if callable(_cur_role_fn) else globals().get('boot_phase'))
+        or 'recovery'
+    )
+    _active_recovery_setup_script = globals().get('setup_script', '')
+    if globals().get('update_sequence_enabled', False):
+        _fault_phase = globals().get('update_sequence_fault_phase')
+        _active_recovery_setup_script = (
+            str((_fault_phase or {}).get('setup_script', '') or '').strip()
+            or _active_recovery_setup_script
+        )
+    if _active_recovery_setup_script and (
+        _cur_phase == 'recovery' or not globals().get('update_sequence_enabled', False)
+    ):
+        _apply_env_fn = globals().get('apply_boundary_setup_environment')
+        if callable(_apply_env_fn):
+            _apply_env_fn()
+        _export_role_fn = globals().get('_export_boot_role_to_monitor')
+        if callable(_export_role_fn):
+            _export_role_fn()
+        monitor.Parse('include @' + _active_recovery_setup_script)
     # The shell was built from the clean ELF, but hardware reset state belongs
     # to the restored persistent image.  Fetch both vector words only after
     # installing that image, including zero/unprogrammed values.
@@ -8517,9 +9129,6 @@ def restore_flash_and_boot(saved_flash):
     _last_recovery_setup_detail['total_s'] = round(
         max(0.0, _time.time() - _restore_started), 6
     )
-    # Do NOT re-run setup_script here.  The faulted snapshot is the
-    # ground-truth state for the recovery boot — re-running setup would
-    # overwrite it with clean data and mask the fault.
 
 def _load_images_mapping(images_map):
     if not images_map:
@@ -8707,6 +9316,9 @@ def _apply_update_phase_pre_boot(phase):
     if boundary_phase.strip().lower() == 'follow_up':
         restore_boundary_persistent_snapshot(boundary_durable_state_file)
     if phase_setup_script:
+        _export_role_fn = globals().get('_export_boot_role_to_monitor')
+        if callable(_export_role_fn):
+            _export_role_fn()
         monitor.Parse('include @' + phase_setup_script)
     _apply_pre_boot_entries(phase.get('pre_boot_state', []))
 
@@ -11790,6 +12402,16 @@ def run_until_done(cpu_ref, time_slice=None, max_iters=200, wall_timeout=120, la
             'console_fatal_pattern': None,
             'lockup_observation': dict(_erased_lockup_boot),
         }
+    try:
+        if not bool(getattr(cpu_ref, 'IsHalted', False)):
+            _th = getattr(cpu_ref, 'TimeHandle', None)
+            if _th is not None:
+                _th.Enabled = True
+    except Exception:
+        pass
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     if time_slice is None:
         time_slice = phase1_time_slice
     t0 = _time.time()
@@ -14108,6 +14730,9 @@ def run_read_bit_flip_fault(fault_at):
     restore_phase1_baseline()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
     reset_verification_probes()
@@ -14325,6 +14950,9 @@ def run_timed_bit_corruption_fault(fault_at, trigger_addr, corrupt_addr, bit_fli
     restore_phase1_baseline()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
     reset_verification_probes()
@@ -14519,6 +15147,9 @@ def run_instruction_skip_fault(skip_addr, skip_count=None, patch_model='nop'):
     restore_phase1_baseline()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
 
@@ -14717,6 +15348,9 @@ def run_timed_reset_fault(fault_at):
     restore_phase1_baseline()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
 
@@ -14932,6 +15566,9 @@ def run_nvs_corruption_fault(variant_idx):
     restore_hw_init()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
     arm_vtor_watchpoint()
@@ -14985,6 +15622,9 @@ def run_metadata_fault(fault_at, fault_type='w'):
     restore_hw_init()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
     disarm_fault()
     arm_vtor_watchpoint()
@@ -15263,6 +15903,9 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'final_reset_kind': _current_kind,
         'signals': signals,
     }
+    _get_role_fn = globals().get('get_boot_role')
+    if callable(_get_role_fn):
+        result['boot_role'] = _get_role_fn()
     if runfor_error_status is not None:
         result['infrastructure_error'] = True
         result['error_kind'] = runfor_error_status.get(
@@ -15451,6 +16094,9 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _cur_role_fn = globals().get('get_boot_role')
+    if callable(_cur_role_fn):
+        result['boot_role'] = _cur_role_fn()
     _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
     if callable(_attach_cov_fn):
         _attach_cov_fn(result, signals, (p2_status,), boot_cycle_records)
@@ -16649,7 +17295,31 @@ def run_execute_fault(
                 }
 
             phase2_t0 = _time.time()
+            _set_role_fn = globals().get('_set_boot_role')
+            if callable(_set_role_fn):
+                _exec_cut = {
+                    'cut': 1,
+                    'fault_at': int(fault_at),
+                    'fault_code': str(fault_type),
+                    'address': int(fault_address),
+                }
+                if fault_pc > 0:
+                    _exec_cut['pc'] = fmt_u32(fault_pc)
+                if fault_call_context:
+                    _exec_cut['call_context'] = fault_call_context
+                _set_role_fn(
+                    phase='recovery',
+                    generation=1,
+                    source='live_injection',
+                    preceding_cut=_exec_cut,
+                    preceding_cuts=[_exec_cut],
+                    reset_kind='power_loss',
+                    cycle=0,
+                )
+            globals()['_pending_recovery_uncorrectable_offsets'] = list(fault_uncorrectable_offsets)
             restore_flash_and_boot(saved_flash)
+            if fault_uncorrectable_offsets:
+                _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
             # Probe only after the exact persisted snapshot has been
             # installed. This matters for writeback durability, where the
             # snapshot may have had volatile writes stripped above.
@@ -16735,6 +17405,27 @@ def run_execute_fault(
             if saved_flash is not None:
                 fault_snapshot_bytes = to_py_bytes(saved_flash)
         phase2_t0 = _time.time()
+        _set_role_fn = globals().get('_set_boot_role')
+        if callable(_set_role_fn):
+            _slow_cut = {
+                'cut': 1,
+                'fault_at': int(fault_at),
+                'fault_code': str(fault_type),
+                'address': int(fault_address),
+            }
+            if fault_pc > 0:
+                _slow_cut['pc'] = fmt_u32(fault_pc)
+            if fault_call_context:
+                _slow_cut['call_context'] = fault_call_context
+            _set_role_fn(
+                phase='recovery',
+                generation=1,
+                source='live_injection',
+                preceding_cut=_slow_cut,
+                preceding_cuts=[_slow_cut],
+                reset_kind='power_loss',
+                cycle=0,
+            )
         _capture_recovery_marker_precondition()
         _machine_reset(apply_tracking_gate=False)
         monitor.Parse('machine Pause')
@@ -16749,7 +17440,24 @@ def run_execute_fault(
             restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
             if restore_raw is not None:
                 restore_raw(saved_flash)
+        if fault_uncorrectable_offsets:
+            _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
+        if globals().get('setup_script') and not globals().get('update_sequence_enabled', False):
+            _apply_env_fn = globals().get('apply_boundary_setup_environment')
+            if callable(_apply_env_fn):
+                _apply_env_fn()
+            _export_role_fn = globals().get('_export_boot_role_to_monitor')
+            if callable(_export_role_fn):
+                _export_role_fn()
+            monitor.Parse('include @' + setup_script)
         prime_bootloader_entry()
+        fault_semantic_state = collect_semantic_state({
+            'cycle': 0,
+            'boot_outcome': 'power_loss_boundary',
+            'boot_slot': None,
+            'fault_injected': bool(fault_injected),
+            'stage': 'fault_snapshot',
+        })
         if _hash_bypass_active:
             apply_hash_bypass()
         reset_nvmc_for_recovery()
@@ -16994,6 +17702,24 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     if saved_flash is None:
         saved_flash = flash_ref.ReadBytes(0, flash_size)
 
+    _set_boot_fn = globals().get('_set_boot_role')
+    p1_cut_info = {
+        'cut': 1,
+        'operation': 'write',
+        'operation_index': int(write_fault_at),
+        'fault_at': int(write_fault_at),
+        'fault_type': 'w',
+    }
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=1,
+            source='live_injection',
+            preceding_cut=p1_cut_info,
+            preceding_cuts=(p1_cut_info,),
+            reset_kind='power_loss',
+            cycle=0,
+        )
     restore_flash_and_boot(saved_flash)
 
     # Reset counters and arm erase fault for recovery boot.
@@ -17026,6 +17752,23 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
         if saved_flash2 is None:
             saved_flash2 = flash_ref.ReadBytes(0, flash_size)
 
+        p2_cut_info = {
+            'cut': 2,
+            'operation': 'erase',
+            'operation_index': int(erase_fault_at),
+            'fault_at': int(erase_fault_at),
+            'fault_type': 'e',
+        }
+        if callable(_set_boot_fn):
+            _set_boot_fn(
+                phase='recovery',
+                generation=2,
+                source='live_injection',
+                preceding_cut=p2_cut_info,
+                preceding_cuts=(p1_cut_info, p2_cut_info),
+                reset_kind='power_loss',
+                cycle=0,
+            )
         restore_flash_and_boot(saved_flash2)
         reset_nvmc_for_recovery()
 
@@ -17150,9 +17893,15 @@ def _phase2_chain_snapshot():
 
 
 def _phase2_chain_restore(snapshot):
-    restore_flash_and_boot(snapshot['flash'])
     otp = backend.get('otp')
-    if otp is not None and 'otp' in snapshot.get('persistent_values', {}):
+    has_otp_snap = otp is not None and 'otp' in snapshot.get('persistent_values', {})
+    if has_otp_snap:
+        globals()['_pending_recovery_otp_snapshot'] = snapshot['persistent_values']['otp']
+    globals()['_pending_recovery_uncorrectable_offsets'] = list(
+        snapshot.get('uncorrectable_offsets', ())
+    )
+    restore_flash_and_boot(snapshot['flash'])
+    if globals().pop('_pending_recovery_otp_snapshot', None) is not None and has_otp_snap:
         otp.TestRestore(snapshot['persistent_values']['otp'])
     _clear_mram_uncorrectable_words()
     _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
@@ -17400,6 +18149,9 @@ def _phase2_chain_evaluated_result(
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _cur_role_fn = globals().get('get_boot_role')
+    if callable(_cur_role_fn):
+        result['boot_role'] = _cur_role_fn()
     _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
     if callable(_attach_cov_fn):
         _attach_cov_fn(result, signals, (status,), boot_cycle_records)
@@ -17464,6 +18216,17 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None, diagnostic=None):
             carried_offsets = []
             carried_addresses = []
         else:
+            _set_boot_fn = globals().get('_set_boot_role')
+            if callable(_set_boot_fn):
+                _set_boot_fn(
+                    phase='recovery',
+                    generation=cut_index,
+                    source='live_injection',
+                    preceding_cut=records[-1] if records else None,
+                    preceding_cuts=records,
+                    reset_kind='power_loss',
+                    cycle=0,
+                )
             _phase2_chain_restore(previous_snapshot)
             carried_offsets = list(previous_snapshot['uncorrectable_offsets'])
             carried_addresses = list(previous_snapshot['uncorrectable_addresses'])
@@ -17481,6 +18244,9 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None, diagnostic=None):
 
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
+        _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+        if callable(_enable_th_fn):
+            _enable_th_fn()
         tracking_start = tracking_start_address_config if cut_index == 0 else (
             _recovery_tracking_start(inherit_first_gate=cross_check_expected is not None)
         )
@@ -17658,6 +18424,17 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None, diagnostic=None):
         return {'phase2_fault_chain': {'cross_check_persistent_state': cross_check_status}}
 
     final_started = _time.time()
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=len(records),
+            source='live_injection',
+            preceding_cut=records[-1] if records else None,
+            preceding_cuts=records,
+            reset_kind='power_loss',
+            cycle=0,
+        )
     _phase2_chain_restore(previous_snapshot)
     records[-1]['fault_semantic_state'] = collect_semantic_state({
         'cycle': 0,
@@ -17764,6 +18541,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     p1_applied_torn_word = mram_torn_word
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     reset_nvmc_for_sweep()
 
     if is_p1_timed:
@@ -17936,6 +18716,35 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
 
     # --- Phase 2: recovery boot with fault armed ---
     phase2_t0 = _time.time()
+    p1_cut_info = {
+        'cut': 1,
+        'operation': 'erase' if is_p1_erase else ('timed' if is_p1_timed else 'write'),
+        'operation_index': int(p1_fault_at),
+        'fault_at': int(p1_fault_at),
+        'fault_type': p1_fault_type,
+        'address': fmt_u32(p1_fault_address),
+        'fault_address': fmt_u32(p1_fault_address),
+    }
+    if p1_fault_pc > 0:
+        p1_cut_info['pc'] = fmt_u32(p1_fault_pc)
+    if p1_fault_call_context:
+        p1_cut_info['call_context'] = p1_fault_call_context
+    if p1_torn_word is not None or p1_flash_torn_word is not None:
+        p1_cut_info['torn_word_mode'] = (
+            p1_flash_torn_word if p1_flash_torn_word is not None else p1_torn_word
+        )
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=1,
+            source='live_injection',
+            preceding_cut=p1_cut_info,
+            preceding_cuts=(p1_cut_info,),
+            reset_kind='power_loss',
+            cycle=0,
+        )
+    globals()['_pending_recovery_uncorrectable_offsets'] = list(p1_uncorrectable_offsets)
     restore_flash_and_boot(saved_flash_p1)
     if p1_uncorrectable_offsets:
         _restore_mram_uncorrectable_offsets(p1_uncorrectable_offsets)
@@ -18139,6 +18948,34 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
 
         # --- Phase 3: boot from double-faulted state ---
         phase3_t0 = _time.time()
+        p2_cut_info = {
+            'cut': 2,
+            'operation': 'erase' if is_p2_erase else ('timed' if is_p2_timed else 'write'),
+            'operation_index': int(p2_fault_at),
+            'fault_at': int(p2_fault_at),
+            'fault_type': p2_fault_type,
+            'address': fmt_u32(p2_fault_address),
+            'fault_address': fmt_u32(p2_fault_address),
+        }
+        if p2_fault_pc > 0:
+            p2_cut_info['pc'] = fmt_u32(p2_fault_pc)
+        if p2_fault_call_context:
+            p2_cut_info['call_context'] = p2_fault_call_context
+        if p2_torn_word is not None or p2_flash_torn_word is not None:
+            p2_cut_info['torn_word_mode'] = (
+                p2_flash_torn_word if p2_flash_torn_word is not None else p2_torn_word
+            )
+        if callable(_set_boot_fn):
+            _set_boot_fn(
+                phase='recovery',
+                generation=2,
+                source='live_injection',
+                preceding_cut=p2_cut_info,
+                preceding_cuts=(p1_cut_info, p2_cut_info),
+                reset_kind='power_loss',
+                cycle=0,
+            )
+        globals()['_pending_recovery_uncorrectable_offsets'] = list(p2_uncorrectable_offsets)
         restore_flash_and_boot(saved_flash_p2)
         if p2_uncorrectable_offsets:
             _restore_mram_uncorrectable_offsets(p2_uncorrectable_offsets)
@@ -18386,6 +19223,9 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _cur_role_fn = globals().get('get_boot_role')
+    if callable(_cur_role_fn):
+        result['boot_role'] = _cur_role_fn()
     _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
     if callable(_attach_cov_fn):
         _attach_cov_fn(
@@ -18550,12 +19390,27 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
             restore_phase1_baseline()
             cpu_ref = monitor.Machine['sysbus.cpu']
             cpu_ref.IsHalted = False
+            _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+            if callable(_enable_th_fn):
+                _enable_th_fn()
         else:
             log('mf seq={} restore_stage{}'.format(seq, idx + 1))
             prev_code = stage_codes[idx - 1]
+            stage_reset_kind = 'power_loss' if prev_code in ('w', 'e', 'a', 't') else 'warm'
             _set_kind_fn = globals().get('_set_next_reset_kind')
             if callable(_set_kind_fn):
-                _set_kind_fn('power_loss' if prev_code in ('w', 'e', 'a', 't') else 'warm')
+                _set_kind_fn(stage_reset_kind)
+            _set_boot_fn = globals().get('_set_boot_role')
+            if callable(_set_boot_fn):
+                _set_boot_fn(
+                    phase='recovery',
+                    generation=idx,
+                    source='live_injection',
+                    preceding_cut=per_fault_states[-1] if per_fault_states else None,
+                    preceding_cuts=per_fault_states,
+                    reset_kind=stage_reset_kind,
+                    cycle=0,
+                )
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -18600,6 +19455,22 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
                     seq, idx + 1, retargeted_from, observed_stage_writes, fault_at
                 )
             )
+            prev_code = stage_codes[idx - 1]
+            stage_reset_kind = 'power_loss' if prev_code in ('w', 'e', 'a', 't') else 'warm'
+            _set_kind_fn = globals().get('_set_next_reset_kind')
+            if callable(_set_kind_fn):
+                _set_kind_fn(stage_reset_kind)
+            _set_boot_fn = globals().get('_set_boot_role')
+            if callable(_set_boot_fn):
+                _set_boot_fn(
+                    phase='recovery',
+                    generation=idx,
+                    source='live_injection',
+                    preceding_cut=per_fault_states[-1] if per_fault_states else None,
+                    preceding_cuts=per_fault_states,
+                    reset_kind=stage_reset_kind,
+                    cycle=0,
+                )
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -18703,9 +19574,21 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
 
     recovery_t0 = _time.time()
     last_code = stage_codes[-1] if stage_codes else 'w'
+    final_reset_kind = 'power_loss' if last_code in ('w', 'e', 'a', 't') else 'warm'
     _set_kind_fn = globals().get('_set_next_reset_kind')
     if callable(_set_kind_fn):
-        _set_kind_fn('power_loss' if last_code in ('w', 'e', 'a', 't') else 'warm')
+        _set_kind_fn(final_reset_kind)
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=len(per_fault_states),
+            source='live_injection',
+            preceding_cut=per_fault_states[-1] if per_fault_states else None,
+            preceding_cuts=per_fault_states,
+            reset_kind=final_reset_kind,
+            cycle=0,
+        )
     restore_flash_and_boot(saved_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -18741,15 +19624,6 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
     if final_status is not None:
         merge_stop_status_signals(signals, 'phase2', final_status)
 
-    semantic_state = collect_semantic_state({
-        'cycle': 0,
-        'boot_outcome': boot_outcome,
-        'boot_slot': boot_slot,
-        'signals': signals,
-        'fault_injected': True,
-        'stage': 'post_boot',
-    })
-    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
     boot_cycle_records, multi_boot_analysis, followup_ms = run_followup_boot_cycles(
         boot_outcome,
         boot_slot,
@@ -18760,6 +19634,18 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
         effective_criteria=eff_criteria,
     )
     signals['followup_ms'] = int(followup_ms)
+    _set_mb_fn = globals().get('set_multiboot_cycles_run')
+    if callable(_set_mb_fn):
+        _set_mb_fn(signals, boot_cycle_records)
+    semantic_state = collect_semantic_state({
+        'cycle': 0,
+        'boot_outcome': boot_outcome,
+        'boot_slot': boot_slot,
+        'signals': signals,
+        'fault_injected': True,
+        'stage': 'post_boot',
+    })
+    fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
     result = {
         'fault_at': seq[0],
@@ -18783,6 +19669,9 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
     if boot_cycle_records is not None:
         result['boot_cycles'] = boot_cycle_records
         result['multi_boot_analysis'] = multi_boot_analysis
+    _cur_role_fn = globals().get('get_boot_role')
+    if callable(_cur_role_fn):
+        result['boot_role'] = _cur_role_fn()
     _attach_cov_fn = globals().get('_attach_result_recovery_coverage')
     if callable(_attach_cov_fn):
         _attach_cov_fn(result, signals, (final_status,), boot_cycle_records)
@@ -20342,6 +21231,42 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     # machine Reset zeroes MappedMemory, so we must write back the faulted
     # snapshot captured above, then reload the bootloader ELF.
     t_reset = _time.time()
+    _cal_pc_fn = globals().get('_get_calibration_op_pc')
+    _native_cal_pc = (
+        _cal_pc_fn(fault_type, fault_at)
+        if (fault_injected and callable(_cal_pc_fn))
+        else None
+    )
+    _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+    _native_cal_ctx = (
+        _cal_ctx_fn(fault_type, fault_at)
+        if (fault_injected and callable(_cal_ctx_fn))
+        else None
+    )
+    _native_cut_info = {
+        'cut': 1,
+        'operation': 'write',
+        'operation_index': int(fault_at),
+        'fault_at': int(fault_at),
+        'fault_type': fault_type,
+        'address': fmt_u32(fault_address),
+        'fault_address': fmt_u32(fault_address),
+    }
+    if _native_cal_pc:
+        _native_cut_info['pc'] = _native_cal_pc
+    if _native_cal_ctx:
+        _native_cut_info['call_context'] = _native_cal_ctx
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=1,
+            source='computed_source',
+            preceding_cut=_native_cut_info if fault_injected else None,
+            preceding_cuts=(_native_cut_info,) if fault_injected else (),
+            reset_kind='warm' if is_non_power_write_fault else 'power_loss',
+            cycle=0,
+        )
     restore_flash_and_boot(faulted_flash)
     fault_semantic_state = collect_semantic_state({
         'cycle': 0,
@@ -20360,6 +21285,9 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
 
     eff_criteria = get_effective_criteria(fault_type)
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     arm_vtor_watchpoint()
     t_emu = _time.time()
     p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
@@ -20781,7 +21709,58 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     # machine Reset zeroes MappedMemory, so we must write back the faulted
     # snapshot captured above, then reload the bootloader ELF.
     t_reset = _time.time()
+    _cal_pc_fn = globals().get('_get_calibration_op_pc')
+    _replay_cal_pc = (
+        mram_fault_evidence.get('fault_pc')
+        if (mram_fault_evidence is not None and mram_fault_evidence.get('fault_pc'))
+        else (
+            _cal_pc_fn(fault_type, fault_at)
+            if (fault_injected and callable(_cal_pc_fn))
+            else None
+        )
+    )
+    _cal_ctx_fn = globals().get('_get_calibration_op_call_context')
+    _replay_cal_ctx = (
+        mram_fault_evidence.get('fault_call_context')
+        if (mram_fault_evidence is not None and mram_fault_evidence.get('fault_call_context'))
+        else (
+            _cal_ctx_fn(fault_type, fault_at)
+            if (fault_injected and callable(_cal_ctx_fn))
+            else None
+        )
+    )
+    _replay_cut_info = {
+        'cut': 1,
+        'operation': 'write',
+        'operation_index': int(fault_at),
+        'fault_at': int(fault_at),
+        'fault_type': fault_type,
+        'address': fmt_u32(fault_address),
+        'fault_address': fmt_u32(fault_address),
+    }
+    if _replay_cal_pc:
+        _replay_cut_info['pc'] = _replay_cal_pc
+    if _replay_cal_ctx:
+        _replay_cut_info['call_context'] = _replay_cal_ctx
+    if mram_power_loss_torn:
+        _replay_cut_info['torn_word_mode'] = (
+            mram_torn_word if backend['kind'] == 'mram' else torn_word
+        )
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=1,
+            source='computed_source',
+            preceding_cut=_replay_cut_info if fault_injected else None,
+            preceding_cuts=(_replay_cut_info,) if fault_injected else (),
+            reset_kind='warm' if is_non_power_write_fault else 'power_loss',
+            cycle=0,
+        )
+    globals()['_pending_recovery_uncorrectable_offsets'] = list(fault_uncorrectable_offsets)
     restore_flash_and_boot(faulted_flash)
+    if fault_uncorrectable_offsets:
+        _restore_mram_uncorrectable_offsets(fault_uncorrectable_offsets)
     fault_semantic_state = collect_semantic_state({
         'cycle': 0,
         'boot_outcome': 'power_loss_boundary',
@@ -20802,6 +21781,9 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
 
     eff_criteria = get_effective_criteria(fault_type)
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     arm_vtor_watchpoint()
     t_emu = _time.time()
     p2_status = globals().get('_run_recovery_boot_until_done', run_until_done)(
@@ -21464,6 +22446,29 @@ def _state_search_boot_state(state, chain, generation):
     state_restore_bytes = to_clr_bytes(state_bytes)
     snapshot_copy_s = max(0.0, _time.time() - snapshot_copy_started)
     setup_started = _time.time()
+    _gen_int = max(1, int(generation))
+    globals()['_trial_boot_reset_kinds'] = ['power_on'] + (
+        ['power_loss'] * max(0, _gen_int - 1)
+    )
+    globals()['_current_boot_reset_kind'] = 'power_loss' if _gen_int > 1 else 'power_on'
+    globals()['_next_reset_kind'] = 'power_loss'
+    if globals().get('power_domain') is not None:
+        try:
+            power_domain.StartTrial()
+        except Exception:
+            pass
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=int(generation),
+            source='computed_source',
+            preceding_cut=chain[-1] if chain else None,
+            preceding_cuts=chain,
+            reset_kind='power_loss',
+            cycle=0,
+        )
+    globals()['_pending_recovery_uncorrectable_offsets'] = list(state_marks)
     restore_flash_and_boot(state_restore_bytes)
     _clear_mram_uncorrectable_words()
     _restore_mram_uncorrectable_offsets(state_marks)
@@ -21495,6 +22500,9 @@ def _state_search_boot_state(state, chain, generation):
             start_identity, trace_clock = _state_search_begin_observation()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     eff_criteria = get_effective_criteria('p2')
     arm_vtor_watchpoint()
     boot_started = _time.time()
@@ -22646,7 +23654,22 @@ def _debug_apply_snapshot_in_place(snapshot):
         _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
 
 
-def _debug_prepare_recovery_boot(snapshot):
+def _debug_prepare_recovery_boot(
+    snapshot, preceding_cuts=(), source='live_injection', reset_kind='power_loss'
+):
+    _cuts_list = list(preceding_cuts or ())
+    _gen_int = max(1, len(_cuts_list))
+    _set_boot_fn = globals().get('_set_boot_role')
+    if callable(_set_boot_fn):
+        _set_boot_fn(
+            phase='recovery',
+            generation=_gen_int,
+            source=source,
+            preceding_cut=_cuts_list[-1] if _cuts_list else None,
+            preceding_cuts=_cuts_list,
+            reset_kind=reset_kind,
+            cycle=0,
+        )
     if backend['kind'] == 'slow':
         _capture_recovery_marker_precondition()
         _machine_reset(apply_tracking_gate=False)
@@ -22676,6 +23699,14 @@ def _debug_prepare_recovery_boot(snapshot):
         _clear_mram_uncorrectable_words()
         if snapshot.get('uncorrectable_offsets'):
             _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
+        if globals().get('setup_script') and not globals().get('update_sequence_enabled', False):
+            _apply_env_fn = globals().get('apply_boundary_setup_environment')
+            if callable(_apply_env_fn):
+                _apply_env_fn()
+            _export_role_fn = globals().get('_export_boot_role_to_monitor')
+            if callable(_export_role_fn):
+                _export_role_fn()
+            monitor.Parse('include @' + setup_script)
         prime_bootloader_entry()
     else:
         _phase2_chain_restore(snapshot)
@@ -22755,6 +23786,24 @@ def _debug_prepare_and_arm_cut(cut_index, cut_at, cut_code, previous_snapshot):
         restore_phase1_baseline()
         carried_offsets = []
     else:
+        _set_boot_fn = globals().get('_set_boot_role')
+        if callable(_set_boot_fn):
+            _prev_cut_info = {
+                'cut': cut_index,
+                'operation': 'write',
+                'operation_index': int(cut_at),
+                'fault_at': int(cut_at),
+                'fault_type': code,
+            }
+            _set_boot_fn(
+                phase='recovery',
+                generation=cut_index,
+                source='live_injection',
+                preceding_cut=_prev_cut_info,
+                preceding_cuts=(_prev_cut_info,),
+                reset_kind='power_loss',
+                cycle=0,
+            )
         _phase2_chain_restore(previous_snapshot)
         carried_offsets = list(
             previous_snapshot.get('uncorrectable_offsets', ())
@@ -22764,6 +23813,9 @@ def _debug_prepare_and_arm_cut(cut_index, cut_at, cut_code, previous_snapshot):
 
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     tracking_start = (
         tracking_start_address_config
         if cut_index == 0
@@ -23719,6 +24771,9 @@ def run_debug_session(fault_at, fault_type='w'):
     monitor.Parse('machine Pause')
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
+    _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+    if callable(_enable_th_fn):
+        _enable_th_fn()
     arm_vtor_watchpoint()
 
     initial_pc = as_int(cpu_ref.GetRegisterUnsafe(15))
@@ -24004,6 +25059,9 @@ def run_debug_session(fault_at, fault_type='w'):
         cpu_ref = monitor.Machine['sysbus.cpu']
         _debug_restore_continuous_execution(cpu_ref)
         cpu_ref.IsHalted = False
+        _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+        if callable(_enable_th_fn):
+            _enable_th_fn()
         arm_vtor_watchpoint()
         try:
             p2_status = run_until_done(
@@ -24024,6 +25082,9 @@ def run_debug_session(fault_at, fault_type='w'):
         # Debugger detached before boot reached a terminal state; finish boot
         cpu_ref = monitor.Machine['sysbus.cpu']
         cpu_ref.IsHalted = False
+        _enable_th_fn = globals().get('_enable_released_cpu_time_handles')
+        if callable(_enable_th_fn):
+            _enable_th_fn()
         arm_vtor_watchpoint()
         try:
             p2_status = run_until_done(

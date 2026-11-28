@@ -681,7 +681,52 @@ def _collect_effective_slots(row, other, comparison, slots):
     return out
 
 
-def _resolve_probe_ranges(row, other, comparison, source, elf, root, state_probe=None, slots=None, page_size=4096, trailer_align=8):
+def _build_probe_boot_role(row, cuts=None):
+    existing = row.get("boot_role") if isinstance(row, dict) else None
+    if isinstance(existing, dict) and existing.get("phase"):
+        role = dict(existing)
+        if cuts and not role.get("preceding_cuts"):
+            role["preceding_cuts"] = [dict(c) for c in cuts]
+            role["preceding_cut"] = dict(cuts[-1])
+            role["cut"] = dict(cuts[-1])
+        return role
+    row_dict = row if isinstance(row, dict) else {}
+    signals = row_dict.get("signals") if isinstance(row_dict.get("signals"), dict) else {}
+    is_ctrl = bool(row_dict.get("is_control") or row_dict.get("fault_type") == "control")
+    phase = "first_operation" if is_ctrl else "recovery"
+    resolved_cuts = [dict(c) for c in (cuts or ())]
+    gen = (
+        0
+        if is_ctrl
+        else int(
+            signals.get("recovery_state_generation")
+            or (len(resolved_cuts) if resolved_cuts else 1)
+        )
+    )
+    replay_mode = str(signals.get("trace_replay_mode") or "").strip().lower()
+    is_computed = bool(
+        replay_mode in ("computed_recovery_state", "python", "native")
+        or row_dict.get("recovery_state_search")
+        or row_dict.get("fault_type") == "rs"
+    )
+    source_kind = "computed_source" if is_computed else "live_injection"
+    last_cut = dict(resolved_cuts[-1]) if resolved_cuts else None
+    reset_kind = "power_on" if is_ctrl else "power_loss"
+    return {
+        "phase": phase,
+        "generation": gen,
+        "source": source_kind,
+        "is_computed_source": is_computed,
+        "is_live_injection": not is_computed,
+        "preceding_cut": last_cut,
+        "preceding_cuts": resolved_cuts,
+        "cut": dict(last_cut) if last_cut is not None else None,
+        "reset_kind": reset_kind,
+        "cycle": 0,
+    }
+
+
+def _resolve_probe_ranges(row, other, comparison, source, elf, root, state_probe=None, slots=None, page_size=4096, trailer_align=8, cuts=None):
     effective_slots = _collect_effective_slots(row, other, comparison, slots)
     align = trailer_align
     for candidate_row in (row, other):
@@ -693,11 +738,22 @@ def _resolve_probe_ranges(row, other, comparison, source, elf, root, state_probe
                         align = int(str(sem["trailer_align"]), 0)
                     except Exception:
                         pass
+    boot_role = _build_probe_boot_role(row, cuts=cuts)
     context = {
         "slots": effective_slots,
         "slot_geometry": effective_slots,
         "page_size": page_size,
         "trailer_align": align,
+        "boot_role": boot_role,
+        "boot_phase": boot_role["phase"],
+        "boot_generation": boot_role["generation"],
+        "boot_source": boot_role["source"],
+        "is_computed_source": boot_role["is_computed_source"],
+        "is_live_injection": boot_role["is_live_injection"],
+        "preceding_cut": boot_role["preceding_cut"],
+        "preceding_cuts": boot_role["preceding_cuts"],
+        "cut": boot_role["cut"],
+        "reset_kind": boot_role["reset_kind"],
     }
     raw_ranges = None
     if isinstance(state_probe, (list, tuple)):
@@ -1065,6 +1121,14 @@ def explain_recovery_failures(
                 flash_base=flash_base,
                 driver_functions=driver_functions,
             )
+        cuts = _resolve_cuts(
+            row,
+            source,
+            calibration_ops=cal_ops,
+            flash_base=flash_base,
+            driver_functions=driver_functions,
+        )
+        if other is not None:
             probe_ranges = _resolve_probe_ranges(
                 row,
                 other,
@@ -1076,15 +1140,9 @@ def explain_recovery_failures(
                 slots=slots,
                 page_size=page_size,
                 trailer_align=trailer_align,
+                cuts=cuts,
             )
             _annotate_comparison_probe_fields(comparison, probe_ranges)
-        cuts = _resolve_cuts(
-            row,
-            source,
-            calibration_ops=cal_ops,
-            flash_base=flash_base,
-            driver_functions=driver_functions,
-        )
         _annotate_row_operation_traces(row, source, driver_functions=driver_functions)
         endpoint = _endpoint(row, expected, source)
         row["failure_explanation"] = {
