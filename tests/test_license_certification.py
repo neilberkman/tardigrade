@@ -244,6 +244,113 @@ class LicenseCertificationTests(unittest.TestCase):
             with self.assertRaisesRegex(CertificationInputError, "git unavailable"):
                 certify(manifest, strict=True)
 
+    def test_strict_checks_included_and_excluded_tracked_files(self):
+        source_release = self._source_release()
+        source_release["require_tracked_completeness"] = True
+        source_release["tracked_exclude_globs"] = ["**/*.elf", "targets/**"]
+        gpl_in_package = self.root / "src" / "helper.c"
+        spdx_line = "/* " + "SPDX-License-Identifier" + ": GPL-3.0-only */\nint x = 0;\n"
+        gpl_in_package.write_text(spdx_line, encoding="utf-8")
+        source_release["file_digests"]["src/helper.c"] = hashlib.sha256(
+            spdx_line.encode("utf-8")
+        ).hexdigest()
+        manifest = self._write_source_manifest(source_release)
+        tracked = [Path("src/main.py"), Path("src/helper.c")]
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            non_strict = certify(manifest, strict=False)
+            strict_res = certify(manifest, strict=True)
+        self.assertTrue(non_strict["certified"])
+        self.assertFalse(strict_res["certified"])
+        self.assertIn(
+            "tracked-file-incompatible-license",
+            {item["code"] for item in strict_res["source_release"]["findings"]},
+        )
+
+        gpl_in_package.unlink()
+        del source_release["file_digests"]["src/helper.c"]
+        excluded_dir = self.root / "targets" / "demo"
+        excluded_dir.mkdir(parents=True, exist_ok=True)
+        gpl_outside_package = excluded_dir / "boot.c"
+        grant_notice = (
+            "/* Free software: you can redistribute it and/or\n"
+            " * modify it under the terms of the GNU General Public License\n"
+            " */\n"
+        )
+        gpl_outside_package.write_text(grant_notice, encoding="utf-8")
+        manifest = self._write_source_manifest(source_release)
+        tracked = [Path("src/main.py"), Path("targets/demo/boot.c")]
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            strict_outside = certify(manifest, strict=True)
+        self.assertFalse(strict_outside["certified"])
+        self.assertIn(
+            "tracked-file-incompatible-license",
+            {item["code"] for item in strict_outside["source_release"]["findings"]},
+        )
+
+    def test_strict_rejects_incompatible_source_despite_policy_override(self):
+        self.policy["licenses"]["GPL-3.0-only"]["decision"] = "allow"
+        (self.root / "policy.json").write_text(
+            json.dumps(self.policy), encoding="utf-8"
+        )
+        source_release = self._source_release()
+        source_release["require_tracked_completeness"] = True
+        gpl_path = self.root / "src" / "override.c"
+        contents = (
+            "/* " + "SPDX-License-Identifier" + ": GPL-3.0-only */\nint x = 0;\n"
+        )
+        gpl_path.write_text(contents, encoding="utf-8")
+        source_release["file_digests"]["src/override.c"] = (
+            hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        )
+        manifest = self._write_source_manifest(source_release)
+        tracked = [Path("src/main.py"), Path("src/override.c")]
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            result = certify(manifest, strict=True)
+        self.assertFalse(result["certified"])
+        self.assertIn(
+            "tracked-file-incompatible-license",
+            {item["code"] for item in result["source_release"]["findings"]},
+        )
+
+    def test_strict_checks_only_tracked_files_and_recognizes_reference_notices(self):
+        source_release = self._source_release()
+        source_release["require_tracked_completeness"] = True
+        source_release["tracked_exclude_globs"] = ["LICENSES/**"]
+        source_release["exclude_globs"].append("**/generated.c")
+        untracked = self.root / "src" / "generated.c"
+        untracked.write_text(
+            "/* " + "SPDX-License-Identifier" + ": GPL-3.0-only */\n",
+            encoding="utf-8",
+        )
+        licenses = self.root / "LICENSES"
+        licenses.mkdir()
+        reference = licenses / "reference.txt"
+        reference.write_bytes((ROOT / "LICENSES" / "GPL-3.0-only.txt").read_bytes())
+        manifest = self._write_source_manifest(source_release)
+        tracked = [Path("src/main.py"), Path("LICENSES/reference.txt")]
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            result = certify(manifest, strict=True)
+        self.assertTrue(result["certified"])
+
+        with reference.open("ab") as handle:
+            handle.write(b"int added_source;\n")
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            altered = certify(manifest, strict=True)
+        self.assertIn(
+            "tracked-file-incompatible-license",
+            {item["code"] for item in altered["source_release"]["findings"]},
+        )
+        tracked.remove(Path("LICENSES/reference.txt"))
+
+        # Tracking the same generated file makes its license relevant.
+        tracked.append(Path("src/generated.c"))
+        with mock.patch("license_certify._git_tracked_files", return_value=tracked):
+            result = certify(manifest, strict=True)
+        self.assertIn(
+            "tracked-file-incompatible-license",
+            {item["code"] for item in result["source_release"]["findings"]},
+        )
+
     def test_missing_provenance_and_link_manifest_fail_closed(self):
         entry = self._entry(kind="distributed")
         del entry["provenance"]

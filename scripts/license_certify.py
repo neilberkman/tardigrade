@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fail-closed certification of Tardigrade release inputs.
 
-The manifest is an evidence ledger, not a license scanner.  Every entry must
-declare its license and identify the evidence used to establish that
-declaration.  The checker deliberately does not infer a license from file
-contents, filenames, package metadata, or notice text.
+Each entry declares its license and the evidence for that declaration. Strict
+source-release checks also reject incompatible license notices in tracked files.
 """
 
 from __future__ import annotations
@@ -72,6 +70,32 @@ SNAPSHOT_FIELDS = frozenset({"path", "sha256", "artifact_sha256"})
 LINK_REF_FIELDS = frozenset({"path", "sha256"})
 LINK_FILE_FIELDS = frozenset({"schema_version", "inputs", "verification_status", "notes"})
 LINK_INPUT_FIELDS = frozenset({"artifact_id", "path", "sha256"})
+# The reference texts already shipped under LICENSES/ contain full grant notices.
+# Pin their contents so added source in that directory is checked as well.
+REFERENCE_NOTICE_DIGESTS = {
+    "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+    "73879138376be7ab8ccdb4eb116f11d215ff70210ca2ab5183b2b6a7276e52a5",
+}
+GPL_SPDX_HEADER_RE = re.compile(
+    r"^\s*(?:#|//+|/\*+|\*+|;+|--+|\.\.|<!--|REM\b)?\s*"
+    r"SPDX-License-Identifier\s*:\s*([^\r\n]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+GPL_SPDX_TOKEN_RE = re.compile(
+    r"\b(?:A|L)?GPL(?:-[0-9.]+(?:-(?:only|or-later)|\+)?)?\b",
+    re.IGNORECASE,
+)
+GPL_GRANT_NOTICE_RE = re.compile(
+    r"redistribute(?:\s|\*)+it(?:\s|\*)+and/or(?:\s|\*)+modify(?:\s|\*)+it"
+    r"(?:\s|\*)+under(?:\s|\*)+the(?:\s|\*)+terms(?:\s|\*)+of(?:\s|\*)+the"
+    r"(?:\s|\*)+GNU(?:\s|\*)+(?:(?:Affero|Lesser|Library)(?:\s|\*)+)?"
+    r"General(?:\s|\*)+Public(?:\s|\*)+License",
+    re.IGNORECASE,
+)
+GPL_LICENSE_TITLE_RE = re.compile(
+    r"^\s*GNU\s+(?:(?:AFFERO|LESSER|LIBRARY)\s+)?GENERAL\s+PUBLIC\s+LICENSE\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 class CertificationInputError(ValueError):
@@ -414,10 +438,33 @@ def _git_tracked_files(root: Path) -> List[Path]:
     return sorted(paths, key=lambda item: item.as_posix())
 
 
+def _detect_gpl_license_marker(root: Path, relative: Path) -> str | None:
+    try:
+        data = (root / relative).read_bytes()
+    except OSError as exc:
+        raise CertificationInputError(f"Could not inspect tracked file {relative}") from exc
+    if relative.parent == Path("LICENSES") and hashlib.sha256(data).hexdigest() in REFERENCE_NOTICE_DIGESTS:
+        return None
+    text = data.decode("utf-8", errors="ignore")
+    for match in GPL_SPDX_HEADER_RE.finditer(text):
+        raw_expr = match.group(1).strip()
+        spdx_expr = re.sub(r"\s*(?:\*/+|-->)\s*$", "", raw_expr).strip()
+        if not GPL_SPDX_TOKEN_RE.search(spdx_expr):
+            continue
+        return f"SPDX-License-Identifier: {spdx_expr}"
+    if GPL_GRANT_NOTICE_RE.search(text):
+        return "GNU General Public License grant notice"
+    if GPL_LICENSE_TITLE_RE.search(text):
+        return "GNU General Public License text"
+    return None
+
+
 def _certify_source_release(
     raw: Any,
     root: Path,
     license_rules: Mapping[str, Any],
+    *,
+    strict: bool = False,
 ) -> Dict[str, Any]:
     """Certify a complete, explicitly bounded source-only package."""
     label = "manifest.source_release"
@@ -440,9 +487,12 @@ def _certify_source_release(
         for index, item in enumerate(raw_tracked_excludes)
     ]
     tracked_excluded: List[str] = []
+    if require_tracked or (strict and (root / ".git").exists()):
+        tracked_paths = _git_tracked_files(root)
+    else:
+        tracked_paths = [path.relative_to(root) for path in paths]
     if require_tracked:
         included_names = {path.relative_to(root).as_posix() for path in paths}
-        tracked_paths = _git_tracked_files(root)
         tracked_names = {path.as_posix() for path in tracked_paths}
         for included_name in sorted(included_names - tracked_names):
             findings.append(
@@ -466,6 +516,20 @@ def _certify_source_release(
                     "error",
                 )
             )
+    if strict:
+        for relative in tracked_paths:
+            candidate = root / relative
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            marker = _detect_gpl_license_marker(root, relative)
+            if marker is not None:
+                findings.append(
+                    _finding(
+                        "tracked-file-incompatible-license",
+                        f"incompatible license in tracked file {relative} ({marker})",
+                        "error",
+                    )
+                )
     raw_digests = value.get("file_digests")
     if not isinstance(raw_digests, Mapping):
         expected_digests: Dict[str, str] = {}
@@ -732,7 +796,12 @@ def certify(manifest_path: Path, policy_path: Path | None = None, *, strict: boo
 
     raw_source_release = manifest.get("source_release")
     source_release = (
-        _certify_source_release(raw_source_release, manifest_path.parent, license_rules)
+        _certify_source_release(
+            raw_source_release,
+            manifest_path.parent,
+            license_rules,
+            strict=strict,
+        )
         if raw_source_release is not None
         else None
     )
