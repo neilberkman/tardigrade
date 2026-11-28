@@ -12,6 +12,8 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
 
 from invariants import InvariantViolation  # noqa: E402
 from targets.rustboot.invariants import (  # noqa: E402
@@ -129,6 +131,79 @@ class RustbootInvariantTests(unittest.TestCase):
 
         self.assertEqual(ctx.exception.invariant_name, "rustboot_swap_flags_consistent")
         self.assertEqual(ctx.exception.details["violating_partitions"], ["boot"])
+
+
+class RustbootGenerateRuntimeProfileTests(unittest.TestCase):
+    def test_synthetic_build_dir_renders_valid_baseline_and_state_search_profiles(
+        self,
+    ) -> None:
+        import shutil
+        import tempfile
+
+        if str(ROOT / "scripts") not in sys.path:
+            sys.path.insert(0, str(ROOT / "scripts"))
+        from profile_loader import load_profile
+        from targets.rustboot.generate_runtime_profile import (
+            main as gen_main,
+            render_runtime_profile,
+            write_runtime_profile,
+        )
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="rustboot_synth_"))
+        try:
+            build_dir = temp_dir / "build"
+            build_dir.mkdir(parents=True, exist_ok=True)
+            (build_dir / "rustboot_nrf52840.elf").write_bytes(b"\x7fELF" + b"\x00" * 60)
+            (build_dir / "rustboot_boot_v1.bin").write_bytes(b"\xAA" * 4352)
+            (build_dir / "rustboot_update_v2.bin").write_bytes(b"\xBB" * 8448)
+
+            out_yaml = build_dir / "rustboot_nrf52840_update.yaml"
+            rendered = render_runtime_profile(build_dir)
+            written = write_runtime_profile(out_yaml, rendered)
+            loaded = load_profile(written, strict=True)
+            self.assertEqual(loaded.platform, "platforms/cortex_m4_flash_fast.repl")
+            self.assertEqual(loaded.flash_backend, "faultFlash")
+            self.assertEqual(loaded.memory.slots["exec"].base, 0x0002F000)
+            self.assertEqual(loaded.memory.slots["staging"].base, 0x00058000)
+            self.assertEqual(loaded.fault_sweep.fault_types, ["power_loss"])
+            self.assertTrue(loaded.expect.should_find_issues)
+
+            rc_ss = gen_main(
+                [
+                    "--build-dir",
+                    str(build_dir),
+                    "--state-search",
+                    "--state-search-max-cuts",
+                    "3",
+                ]
+            )
+            self.assertEqual(rc_ss, 0)
+            ss_yaml = build_dir / "rustboot_nrf52840_state_search.yaml"
+            loaded_ss = load_profile(ss_yaml, strict=True)
+            self.assertTrue(loaded_ss.fault_sweep.include_erase_fault_points)
+            self.assertTrue(loaded_ss.fault_sweep.torn_word_explicit)
+            self.assertEqual(loaded_ss.fault_sweep.torn_word_seed, 20261127)
+            self.assertTrue(loaded_ss.fault_sweep.phase2_fault.enabled)
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.first_fault_types,
+                ["power_loss", "interrupted_erase"],
+            )
+            self.assertEqual(
+                loaded_ss.fault_sweep.phase2_fault.fault_types,
+                ["power_loss", "interrupted_erase"],
+            )
+            ss = loaded_ss.fault_sweep.phase2_fault.state_search
+            self.assertTrue(ss.enabled)
+            self.assertEqual(ss.max_cuts, 3)
+            self.assertEqual(ss.max_new_states, 64)
+            self.assertEqual(ss.cross_check_every, 4)
+            self.assertEqual(len(ss.address_ranges), 3)
+            self.assertTrue(loaded_ss.expect.should_find_issues)
+
+            with self.assertRaisesRegex(ValueError, "Refusing to write"):
+                write_runtime_profile(ROOT / "profiles" / "forbidden.yaml", rendered)
+        finally:
+            shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":
