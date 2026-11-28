@@ -498,6 +498,22 @@ def test_recovery_coverage_requires_effective_execute_mode(tmp_path: Path) -> No
     from profile_loader import load_profile
     from sweep import validate_runtime_fault_mode_compat
 
+    tracked_path = (
+        ROOT / "examples/phase2_mram_parity/profile_state_search_coverage.yaml"
+    )
+    tracked = load_profile(tracked_path)
+    assert tracked.fault_sweep.recovery_coverage.enabled is True
+    assert tracked.fault_sweep.recovery_coverage.mechanism == "oneshot_address_hooks"
+    assert list(tracked.fault_sweep.recovery_coverage.functions) == [
+        "Reset_Handler",
+        "HardFault_Handler",
+    ]
+    assert tracked.fault_sweep.phase2_fault.state_search.order == "coverage_guided"
+    assert (
+        tracked.fault_sweep.phase2_fault.state_search.max_boots_without_new_coverage
+        == 4
+    )
+
     profile_path = tmp_path / "coverage.yaml"
     base_profile = ROOT / "examples/phase2_mram_parity/profile_state_search.yaml"
     profile_path.write_text(

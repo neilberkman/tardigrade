@@ -1,0 +1,10 @@
+base_profile: profile_state_search.yaml
+name: phase2_mram_state_search_coverage
+description: Coverage-guided recovery-state search with per-function and per-line recovery coverage.
+fault_sweep:
+  recovery_coverage:
+    functions: [Reset_Handler, HardFault_Handler]
+  phase2_fault:
+    state_search:
+      order: coverage_guided
+      max_boots_without_new_coverage: 4
