@@ -1,0 +1,14 @@
+base_profile: profile_deferred_state_search_16_half.yaml
+name: phase2_mram_request_recovery_reset
+description: Interrupt the requested update, then interrupt recovery with the request cleared.
+fault_sweep:
+  # First instruction after the request-only call to tracking_gate in firmware_deferred.elf.
+  tracking_start_address: 0x100000B6
+  recovery_tracking_start_address: reset
+  # Make each of the four recovery cuts produce a distinct state for live comparison.
+  mram_torn_word: corrupted
+  phase2_fault:
+    state_search:
+      first_cuts:
+        mode: ranges
+        ranges: [{start: 0, end: 0}]

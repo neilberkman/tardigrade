@@ -96,6 +96,33 @@ campaign write 1. A peripheral reset preserves storage and restores a
 configured nonzero boundary to its waiting state; profiles that omit the
 boundary retain the prior always-active behavior.
 
+For recovery-state searches and explicit phase-two pairs or chains, set
+`fault_sweep.recovery_tracking_start_address` to `reset` (or `0`) to count
+from the first instruction after a cut, or to an instruction address to wait
+for a different recovery boundary.
+
+```yaml
+fault_sweep:
+  tracking_start_address: 0x100000B6
+  recovery_tracking_start_address: reset
+```
+
+The first address applies to calibration and cut one. The recovery setting
+applies on the boot where cut two is armed and on each later chain boot.
+It also applies to the boot used to evaluate the final state. Omitting the
+setting lets a search and its live cross-checks inherit the first-cut
+address. Standalone explicit recovery cuts then count from reset.
+
+Both the computed recovery boot and live chain restore the persistent bytes
+and uncorrectable marks into a recovery shell. The host supplies the original
+request through first-boot setup. Put a one-shot request in a declared
+volatile region so the shell clears it on recovery. If a harness replays an
+input on recovery, deliver the same payload on the same logical boot at the
+same emulated time or instruction boundary in both runs. Boot one is the
+original update. After one cut the computed source boot is boot two, the
+same boot that arms cut two in the live chain. Use timing relative to that
+boot, independently of search traversal order or host wall time.
+
 ## Profile inheritance
 
 A profile can extend a base profile with `base_profile`. The child profile deep-merges on top of the base: dicts merge recursively, lists and scalars in the child replace the base value. The base path is resolved relative to the child profile's directory.
@@ -1867,6 +1894,13 @@ configured follow-up boot, so follow-up execution cannot replace the trace
 associated with the evaluated result. The search still refuses a partial or
 invalid captured snapshot, or a backend whose snapshot contract does not
 cover all bytes, MRAM uncorrectable marks, and declared persistent values.
+With an explicit recovery start, the search summary and state records include
+`recovery_tracking_start_address` (`0x00000000` denotes reset). Each
+nonterminal state's `recovery_tracking_gate` records the start used, whether
+it was reached, the trace length in `traced_operations`, and the size after
+fault-type and address filtering in `candidate_operations`. At reset the
+interrupted state itself supplies the trace base. A nonzero recovery address
+requires a backend that captures the complete MRAM state at that boundary.
 Because `state_search`
 uses execute mode, code must also run from directly executable memory; a pure
 `NVMemory` instruction-fetch platform is rejected at profile load time. These
