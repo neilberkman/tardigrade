@@ -85,6 +85,8 @@ ${PHASE2_WALL_TIMEOUT_S}       30
 ${RUNFOR_WATCHDOG_TIMEOUT_S}   300
 ${TEST_RUNFOR_ERROR_LABEL}     ${EMPTY}
 ${VOLATILE_REGIONS_B64}        ${EMPTY}
+${RETAINED_REGIONS_B64}        ${EMPTY}
+${VBAT_PRESENT}                ${EMPTY}
 ${ZERO_POINT_EXECUTE_CONTROL}  false
 ${BOOT_CYCLE_HOOK}            ${EMPTY}
 ${EXPECTED_ROLLBACK_AT_CYCLE}    ${EMPTY}
@@ -197,6 +199,7 @@ Load Runtime Scenario
     Execute Command    include "${ROOT}/peripherals/I2CFaultProxy.cs"
     Execute Command    include "${ROOT}/peripherals/SPINORFlash.cs"
     Execute Command    include "${ROOT}/peripherals/I2CEEPROM.cs"
+    Execute Command    include "${ROOT}/peripherals/PowerResetDomain.cs"
     Run Keyword If    '${EXTRA_PERIPHERALS}' != ''    Load Extra Peripherals
     Execute Command    mach create
     Execute Command    machine LoadPlatformDescription @${PLATFORM_REPL}
@@ -239,6 +242,8 @@ Run Runtime Fault Point
     Execute Command    $phase2_state_search_b64="${PHASE2_STATE_SEARCH_B64}"
     Execute Command    $recovery_coverage_b64="${RECOVERY_COVERAGE_B64}"
     Execute Command    $volatile_regions_b64="${VOLATILE_REGIONS_B64}"
+    Run Keyword If    '${RETAINED_REGIONS_B64}' != ''    Execute Command    $retained_regions_b64="${RETAINED_REGIONS_B64}"
+    Run Keyword If    '${VBAT_PRESENT}' != ''    Execute Command    $vbat_present="${VBAT_PRESENT}"
     Execute Command    $slot_exec_base=${SLOT_EXEC_BASE}
     Execute Command    $slot_exec_size=${SLOT_EXEC_SIZE}
     Execute Command    $slot_staging_base=${SLOT_STAGING_BASE}

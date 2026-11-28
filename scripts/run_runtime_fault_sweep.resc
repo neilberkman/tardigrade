@@ -168,6 +168,8 @@ $debug_timeout_s?="300"
 $debug_expected_state_id?=""
 $debug_expected_state_file?=""
 $debug_state_search_gated?="false"
+$retained_regions_b64?=""
+$vbat_present?=""
 
 python """
 import os as _os

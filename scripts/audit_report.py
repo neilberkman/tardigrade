@@ -1143,6 +1143,10 @@ def summarize_runtime_sweep(
         if "final_boot_outcome" in ctrl:
             control_summary["final_boot_outcome"] = ctrl.get("final_boot_outcome")
             control_summary["final_boot_slot"] = ctrl.get("final_boot_slot")
+        if "reset_kind" in ctrl:
+            control_summary["reset_kind"] = ctrl.get("reset_kind")
+        if "boot_reset_kinds" in ctrl:
+            control_summary["boot_reset_kinds"] = ctrl.get("boot_reset_kinds")
         ctrl_signals = ctrl.get("signals") or {}
         control_telemetry = {
             key: ctrl_signals.get(key)

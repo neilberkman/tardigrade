@@ -1213,14 +1213,25 @@ def refresh_runtime_handles():
             backend['i2c_proxy'] = monitor.Machine[backend['i2c_sysbus_name']]
         except:
             pass
+    if 'power_domain' in globals():
+        try:
+            globals()['power_domain'] = monitor.Machine['sysbus.powerDomain']
+        except Exception:
+            pass
     console_peripherals, console_peripheral_names = _get_console_peripherals()
     log('console_peripherals_refresh: {}'.format(','.join(console_peripheral_names) if console_peripheral_names else 'none'))
 
 
 def _machine_reset(apply_tracking_gate=True):
     _set_preserve_counters_across_reset(False)
+    _before_reset_fn = globals().get('_before_machine_reset')
+    if callable(_before_reset_fn):
+        _before_reset_fn()
     monitor.Parse('machine Reset')
     refresh_runtime_handles()
+    _after_reset_fn = globals().get('_after_machine_reset')
+    if callable(_after_reset_fn):
+        _after_reset_fn()
     address = None if apply_tracking_gate else 0
     _configure_tracking_start_address(address)
     _set_preserve_counters_across_reset(True)
@@ -1236,6 +1247,14 @@ def _clear_volatile_memory():
     """Clear every profile-declared volatile range before a recovery boot."""
     import System
     chunk_limit = 65536
+    active_retained = list(globals().get('retained_regions') or ())
+    active_reset_kind = str(globals().get('_current_boot_reset_kind') or 'power_loss')
+    saved_retained = []
+    if active_retained and active_reset_kind == 'warm':
+        for r_item in active_retained:
+            r_base = int(r_item['base'])
+            r_size = int(r_item['size'])
+            saved_retained.append((r_base, bus.ReadBytes(r_base, r_size)))
     for region in volatile_regions:
         region_base = int(region['base'])
         region_size = int(region['size'])
@@ -1274,6 +1293,22 @@ def _clear_volatile_memory():
                 )
         log('recovery: cleared volatile region {} at {} ({} bytes)'.format(
             region.get('name', 'unnamed'), fmt_u32(region_base), region_size))
+    if active_retained:
+        if active_reset_kind == 'warm':
+            for r_base, r_bytes in saved_retained:
+                bus.WriteBytes(r_bytes, r_base)
+        else:
+            for r_item in active_retained:
+                r_base = int(r_item['base'])
+                r_size = int(r_item['size'])
+                r_fill = int(r_item.get('fill', 0)) & 0xFF
+                if active_reset_kind == 'power_on':
+                    r_fill = 0
+                if r_fill != 0:
+                    fill_buf = System.Array.CreateInstance(System.Byte, r_size)
+                    for i in range(r_size):
+                        fill_buf[i] = r_fill
+                    bus.WriteBytes(fill_buf, r_base)
 
 
 def _capture_recovery_marker_precondition():
@@ -1595,6 +1630,42 @@ if volatile_regions_b64:
             'base': base,
             'size': size,
         })
+retained_regions = []
+retained_regions_b64 = get_optional_var('retained_regions_b64', '')
+if retained_regions_b64:
+    try:
+        decoded_retained_regions = json.loads(
+            base64.b64decode(retained_regions_b64).decode('utf-8')
+        )
+    except Exception as exc:
+        raise RuntimeError('invalid retained region payload: {}'.format(exc))
+    if not isinstance(decoded_retained_regions, list):
+        raise RuntimeError('retained region payload must be a list')
+    for index, region in enumerate(decoded_retained_regions):
+        if not isinstance(region, dict):
+            raise RuntimeError('retained region {} must be a mapping'.format(index))
+        base = int(region.get('base', -1))
+        size = int(region.get('size', 0))
+        fill = int(region.get('fill', 0))
+        if base < 0 or size <= 0 or base + size > 0x100000000:
+            raise RuntimeError('retained region {} has an invalid range'.format(index))
+        if fill < 0 or fill > 0xFF:
+            raise RuntimeError('retained region {} has an invalid fill byte'.format(index))
+        retained_regions.append({
+            'name': str(region.get('name') or 'retained_{}'.format(index)),
+            'base': base,
+            'size': size,
+            'fill': fill,
+        })
+vbat_present_raw = get_optional_var('vbat_present', '').strip().lower()
+if vbat_present_raw in ('1', 'true', 'yes'):
+    vbat_present_config = True
+elif vbat_present_raw in ('0', 'false', 'no'):
+    vbat_present_config = False
+else:
+    vbat_present_config = None
+if retained_regions or vbat_present_config is not None:
+    enable_machine_snapshots = False
 bootloader_entry = int(str(monitor.GetVariable('bootloader_entry')), 0)
 bootloader_elf = str(monitor.GetVariable('bootloader_elf')).strip()
 platform_repl_path = get_optional_var('platform_repl', '').strip()
@@ -1752,6 +1823,140 @@ backend['bus_base'] = backend_bus_base
 backend['bus_size'] = backend_bus_size
 if backend['kind'] == 'mram' and hasattr(backend['data'], 'ProgramAddressBase'):
     backend['data'].ProgramAddressBase = int(backend_bus_base or 0)
+
+_RESET_DOMAIN_FAMILIES = {
+    'cortex_m4_flash_fast': 'nrf52840',
+    'nrf52840': 'nrf52840',
+    'nrf52840_external_nvm': 'nrf52840',
+    'nrf52840_mcuboot_spi_nor': 'nrf52840',
+    'nrf52840_nvmc_psel': 'nrf52840',
+    'stm32f103': 'stm32f1',
+    'stm32f4': 'stm32f4',
+    'stm32f4_ccm': 'stm32f4',
+    'stm32f4_dual_bank': 'stm32f4',
+    'stm32f4_fast': 'stm32f4',
+    'stm32f4_interceptor': 'stm32f4',
+    'stm32f4_otp': 'stm32f4',
+    'stm32h743_dual_bank_fast': 'stm32h7',
+    'stm32h743_fast': 'stm32h7',
+    'stm32h753': 'stm32h7',
+    'stm32l476': 'stm32l4',
+}
+
+
+def _detect_reset_family(platform_path):
+    if not platform_path:
+        return None
+    stem = os.path.splitext(os.path.basename(str(platform_path).strip()))[0]
+    return _RESET_DOMAIN_FAMILIES.get(stem)
+
+
+reset_family = _detect_reset_family(platform_repl_path)
+power_domain = None
+_next_reset_kind = 'power_on'
+_current_boot_reset_kind = 'power_on'
+_trial_boot_reset_kinds = []
+
+
+def _ensure_power_reset_domain():
+    global power_domain
+    try:
+        power_domain = monitor.Machine['sysbus.powerDomain']
+    except Exception:
+        power_domain = None
+    if power_domain is None and reset_family is not None and repo_root:
+        overlay_path = os.path.join(
+            repo_root, 'platforms', 'reset', '{}.repl'.format(reset_family)
+        )
+        if os.path.isfile(overlay_path):
+            try:
+                monitor.Parse('machine LoadPlatformDescription @{}'.format(overlay_path))
+                power_domain = monitor.Machine['sysbus.powerDomain']
+                log('power_domain: loaded overlay {}'.format(overlay_path))
+            except Exception as exc:
+                log('WARNING: failed to load power domain overlay {}: {}'.format(overlay_path, exc))
+                power_domain = None
+    if power_domain is not None:
+        try:
+            power_domain.Initialize()
+            if vbat_present_config is not None:
+                power_domain.VbatPresent = bool(vbat_present_config)
+            power_domain.ClearRetainedRegions()
+            for region in retained_regions:
+                power_domain.AddRetainedRegion(
+                    int(region['base']),
+                    int(region['size']),
+                    int(region.get('fill', 0)) & 0xFF,
+                )
+        except Exception as exc:
+            log('WARNING: failed to configure powerDomain: {}'.format(exc))
+    return power_domain
+
+
+def _set_next_reset_kind(kind):
+    global _next_reset_kind
+    _next_reset_kind = str(kind or 'power_loss')
+
+
+def _reset_trial_boot_history(initial_next_kind='power_on'):
+    global _trial_boot_reset_kinds, _next_reset_kind, _current_boot_reset_kind
+    _trial_boot_reset_kinds = []
+    _next_reset_kind = str(initial_next_kind or 'power_on')
+    _current_boot_reset_kind = _next_reset_kind
+
+
+def _sync_boot_reset_kinds_from_domain():
+    global _trial_boot_reset_kinds, _current_boot_reset_kind
+    dom = globals().get('power_domain')
+    if dom is None:
+        return
+    try:
+        domain_boots = int(dom.BootCount)
+    except Exception:
+        return
+    history = list(globals().get('_trial_boot_reset_kinds') or ())
+    if domain_boots > len(history):
+        while len(history) < domain_boots:
+            history.append('warm')
+        _trial_boot_reset_kinds = history
+        _current_boot_reset_kind = 'warm'
+
+
+def _before_machine_reset():
+    global _next_reset_kind, _current_boot_reset_kind
+    dom = globals().get('power_domain')
+    reset_kind = str(globals().get('_next_reset_kind') or 'power_loss')
+    if reset_kind != 'power_on':
+        _sync_boot_reset_kinds_from_domain()
+    _current_boot_reset_kind = reset_kind
+    if dom is None:
+        return
+    try:
+        if reset_kind == 'power_on':
+            dom.StartTrial()
+            dom.PreparePowerOn()
+        elif reset_kind == 'power_loss':
+            dom.BeginPowerLoss()
+    except Exception as exc:
+        log('WARNING: powerDomain pre-reset hook failed ({}): {}'.format(reset_kind, exc))
+
+
+def _after_machine_reset():
+    global _next_reset_kind, _current_boot_reset_kind, _trial_boot_reset_kinds
+    dom = globals().get('power_domain')
+    reset_kind = str(globals().get('_current_boot_reset_kind') or 'power_loss')
+    if dom is not None and reset_kind == 'power_loss':
+        try:
+            dom.EndPowerLoss()
+        except Exception as exc:
+            log('WARNING: powerDomain post-reset hook failed: {}'.format(exc))
+    history = list(globals().get('_trial_boot_reset_kinds') or ())
+    history.append(reset_kind)
+    _trial_boot_reset_kinds = history
+    _next_reset_kind = 'power_loss'
+
+
+_ensure_power_reset_domain()
 
 # Legacy alias retained for non-read-fault call sites (slot-fill residual
 # writes, timed_bit_corruption); do not use for read-fault address
@@ -2622,6 +2827,50 @@ def annotate_boot_span_result(result):
     result['initial_boot_slot'] = initial_slot
     result['final_boot_outcome'] = final_outcome
     result['final_boot_slot'] = final_slot
+    _sync_fn = globals().get('_sync_boot_reset_kinds_from_domain')
+    if callable(_sync_fn):
+        _sync_fn()
+    boot_reset_kinds = result.get('boot_reset_kinds')
+    if not isinstance(boot_reset_kinds, list) or not boot_reset_kinds:
+        if isinstance(boot_cycles, list) and boot_cycles:
+            cycle_kinds = [
+                str(c.get('reset_kind'))
+                for c in boot_cycles
+                if isinstance(c, dict) and c.get('reset_kind')
+            ]
+        else:
+            cycle_kinds = []
+        trial_kinds = list(globals().get('_trial_boot_reset_kinds') or ())
+        if len(trial_kinds) >= len(cycle_kinds) and trial_kinds:
+            boot_reset_kinds = trial_kinds
+        elif cycle_kinds:
+            boot_reset_kinds = cycle_kinds
+        elif result.get('reset_kind'):
+            boot_reset_kinds = [str(result.get('reset_kind'))]
+        else:
+            default_kind = str(globals().get('_current_boot_reset_kind') or 'power_on')
+            boot_reset_kinds = [default_kind]
+    else:
+        boot_reset_kinds = [str(item) for item in boot_reset_kinds if item]
+    initial_reset_kind = result.get('initial_reset_kind')
+    if initial_reset_kind is None:
+        if boot_reset_kinds:
+            initial_reset_kind = boot_reset_kinds[0]
+        elif isinstance(first_cycle, dict) and first_cycle.get('reset_kind'):
+            initial_reset_kind = str(first_cycle.get('reset_kind'))
+    final_reset_kind = result.get('final_reset_kind')
+    if final_reset_kind is None:
+        if boot_reset_kinds:
+            final_reset_kind = boot_reset_kinds[-1]
+        elif isinstance(last_cycle, dict) and last_cycle.get('reset_kind'):
+            final_reset_kind = str(last_cycle.get('reset_kind'))
+    reset_kind = result.get('reset_kind')
+    if reset_kind is None:
+        reset_kind = final_reset_kind or initial_reset_kind or 'power_on'
+    result['reset_kind'] = reset_kind
+    result['boot_reset_kinds'] = list(boot_reset_kinds)
+    result['initial_reset_kind'] = initial_reset_kind or reset_kind
+    result['final_reset_kind'] = final_reset_kind or reset_kind
     mba = result.get('multi_boot_analysis')
     if isinstance(mba, dict) and mba.get('status') == 'infra_error':
         result['infrastructure_error'] = True
@@ -4761,12 +5010,18 @@ def collect_semantic_state(context):
 
 def build_cycle_record(cycle_index, boot_outcome, boot_slot, signals, stop_status=None,
                        fault_injected=False):
+    _sync_fn = globals().get('_sync_boot_reset_kinds_from_domain')
+    if callable(_sync_fn):
+        _sync_fn()
+    _cycle_reset_kind = str(globals().get('_current_boot_reset_kind') or 'power_on')
     record = {
         'cycle': int(cycle_index),
         'boot_outcome': boot_outcome,
         'boot_slot': boot_slot,
+        'reset_kind': _cycle_reset_kind,
         'signals': dict(signals) if isinstance(signals, dict) else {},
     }
+    record['signals'].setdefault('reset_kind', _cycle_reset_kind)
     if stop_status is not None:
         record['stop_reason'] = stop_status.get('reason')
         record['emulated_s'] = stop_status.get('emulated_s')
@@ -5266,6 +5521,9 @@ def _continue_followup_boot_cycles(cycle_records, start_cycle_index, fault_injec
             current_flash = b['data'].ReadBytes(0, flash_size)
         else:
             current_flash = b['data'].Flash.ReadBytes(0, flash_size)
+        _set_kind_fn = globals().get('_set_next_reset_kind')
+        if callable(_set_kind_fn):
+            _set_kind_fn('warm')
         restore_flash_and_boot(current_flash)
         if followup_uncorr:
             _restore_mram_uncorrectable_offsets(followup_uncorr)
@@ -5434,6 +5692,9 @@ def run_hook_fault(hook_fault_at, hook_fault_type='w'):
 
     current_flash = _snapshot_current_flash()
     phase2_t0 = _time.time()
+    _set_kind_fn = globals().get('_set_next_reset_kind')
+    if callable(_set_kind_fn):
+        _set_kind_fn('power_loss' if hook_fault_type == 'w' else 'warm')
     restore_flash_and_boot(current_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -5748,6 +6009,9 @@ def run_confirm_cycle_fault(cc_fault_at, cc_fault_type='w'):
     # Phase 3: Reboot and evaluate.
     current_flash = _snapshot_current_flash()
     phase3_t0 = _time.time()
+    _set_kind_fn = globals().get('_set_next_reset_kind')
+    if callable(_set_kind_fn):
+        _set_kind_fn('power_loss' if cc_fault_type == 'w' else 'warm')
     restore_flash_and_boot(current_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -7603,6 +7867,9 @@ def prepare_clean_phase1_state():
     global _last_phase1_setup_detail
     _setup_started = _time.time()
     _reset_started = _time.time()
+    _reset_hist_fn = globals().get('_reset_trial_boot_history')
+    if callable(_reset_hist_fn):
+        _reset_hist_fn('power_on')
     _machine_reset()
     _reset_s = max(0.0, _time.time() - _reset_started)
     monitor.Parse('machine Pause')
@@ -7650,6 +7917,9 @@ def restore_phase1_baseline():
     if update_sequence_enabled:
         ensure_update_sequence_fault_baseline()
         _apply_phase_context(update_sequence_fault_phase)
+        _reset_hist_fn = globals().get('_reset_trial_boot_history')
+        if callable(_reset_hist_fn):
+            _reset_hist_fn('warm')
         restore_flash_and_boot(_cached_update_sequence_fault_flash)
         _apply_update_phase_pre_boot(update_sequence_fault_phase)
         if _hash_bypass_active:
@@ -7674,6 +7944,12 @@ def restore_phase1_baseline():
         return
     _snapshot_load_started = _time.time()
     load_machine_snapshot(_cached_phase1_snapshot_path)
+    _reset_hist_fn = globals().get('_reset_trial_boot_history')
+    if callable(_reset_hist_fn):
+        _reset_hist_fn('power_on')
+    globals()['_trial_boot_reset_kinds'] = ['power_on']
+    globals()['_current_boot_reset_kind'] = 'power_on'
+    globals()['_next_reset_kind'] = 'power_loss'
     _last_phase1_setup_detail = {
         'mode': 'machine_snapshot_load',
         'snapshot_load_s': round(
@@ -7996,6 +8272,9 @@ def _run_clean_update_phase(phase, phase_index):
     _prepare_update_phase_start_state(phase, phase_index)
     phase_name = str(phase.get('name', 'phase_{}'.format(phase_index)))
     phase_start_flash = _snapshot_current_flash()
+    _reset_hist_fn = globals().get('_reset_trial_boot_history')
+    if callable(_reset_hist_fn):
+        _reset_hist_fn('power_on' if int(phase_index) == 0 else 'warm')
     restore_flash_and_boot(phase_start_flash)
     _apply_update_phase_pre_boot(phase)
     if _hash_bypass_active:
@@ -10032,6 +10311,7 @@ def run_state_fault(fault_at):
     eff_criteria = get_effective_criteria(requested_fault_type)
     fault_class = classify_fault_result(boot_outcome, boot_slot, signals, effective_criteria=eff_criteria)
 
+    _state_reset_kinds = ['power_on', 'power_loss'] if fault_injected else ['power_on']
     result = {
         'fault_at': fault_at,
         'fault_requested': fault_at,
@@ -10042,6 +10322,10 @@ def run_state_fault(fault_at):
         'boot_slot': boot_slot,
         'fault_class': fault_class,
         'actual_writes': actual_writes,
+        'reset_kind': _state_reset_kinds[-1],
+        'boot_reset_kinds': list(_state_reset_kinds),
+        'initial_reset_kind': _state_reset_kinds[0],
+        'final_reset_kind': _state_reset_kinds[-1],
         'signals': signals,
     }
     if signals.get('matched_image') is not None:
@@ -13341,6 +13625,7 @@ def run_nvs_corruption_fault(variant_idx):
         variant_idx, mode, nvs_region_addr, nvs_region_size))
 
     # Reset machine and reload images.
+    _reset_trial_boot_history('power_on')
     _machine_reset()
     monitor.Parse('machine Pause')
     reload_images()
@@ -13402,6 +13687,7 @@ def run_metadata_fault(fault_at, fault_type='w'):
     fp_t0 = _time.time()
     m_type = fault_type
     log('fp={} type=m:{} metadata_fault_setup'.format(fault_at, m_type))
+    _reset_trial_boot_history('power_on')
     _machine_reset()
     monitor.Parse('machine Pause')
     reload_images()
@@ -13658,6 +13944,23 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         except Exception:
             pass
 
+    _sync_fn = globals().get('_sync_boot_reset_kinds_from_domain')
+    if callable(_sync_fn):
+        _sync_fn()
+    _boot_kinds = list(globals().get('_trial_boot_reset_kinds') or ())
+    if not _boot_kinds:
+        if isinstance(boot_cycle_records, list) and boot_cycle_records:
+            _boot_kinds = [
+                str(c.get('reset_kind') or 'power_on')
+                for c in boot_cycle_records
+                if isinstance(c, dict)
+            ]
+        else:
+            _boot_kinds = [str(globals().get('_current_boot_reset_kind') or 'power_on')]
+    _current_kind = _boot_kinds[-1] if _boot_kinds else 'power_on'
+    signals['reset_kind'] = _current_kind
+    signals['boot_reset_kinds'] = list(_boot_kinds)
+
     result = {
         'fault_at': fault_at,
         'fault_requested': fault_at,
@@ -13668,6 +13971,10 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
         'boot_slot': boot_slot,
         'fault_class': fault_class,
         'actual_writes': actual_writes,
+        'reset_kind': _current_kind,
+        'boot_reset_kinds': list(_boot_kinds),
+        'initial_reset_kind': _boot_kinds[0] if _boot_kinds else _current_kind,
+        'final_reset_kind': _current_kind,
         'signals': signals,
     }
     if runfor_error_status is not None:
@@ -15320,6 +15627,7 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
     # --- Phase 1: write fault to create dirty state ---
     monitor.Parse('machine Pause')
     cpu_ref.IsHalted = False
+    _reset_trial_boot_history('power_on')
     _machine_reset()
     reload_images_cached()
     apply_pre_boot_state()
@@ -16896,6 +17204,10 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
             cpu_ref.IsHalted = False
         else:
             log('mf seq={} restore_stage{}'.format(seq, idx + 1))
+            prev_code = stage_codes[idx - 1]
+            _set_kind_fn = globals().get('_set_next_reset_kind')
+            if callable(_set_kind_fn):
+                _set_kind_fn('power_loss' if prev_code in ('w', 'e', 'a', 't') else 'warm')
             restore_flash_and_boot(stage_input_flash)
             if _hash_bypass_active:
                 apply_hash_bypass()
@@ -17042,6 +17354,10 @@ def run_multi_fault_sequence(fault_sequence, stage_codes=None):
         }
 
     recovery_t0 = _time.time()
+    last_code = stage_codes[-1] if stage_codes else 'w'
+    _set_kind_fn = globals().get('_set_next_reset_kind')
+    if callable(_set_kind_fn):
+        _set_kind_fn('power_loss' if last_code in ('w', 'e', 'a', 't') else 'warm')
     restore_flash_and_boot(saved_flash)
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -18590,6 +18906,17 @@ def run_trace_replay_fault_native(fault_at, fault_type='w'):
     # No machine Reset needed — reload_images_cached() overwrites full flash,
     # and trace replay is pure memory writes (no CPU execution).
     t_reload = _time.time()
+    _reset_hist_fn = globals().get('_reset_trial_boot_history')
+    if callable(_reset_hist_fn):
+        _reset_hist_fn('power_on')
+    globals()['_trial_boot_reset_kinds'] = ['power_on']
+    globals()['_current_boot_reset_kind'] = 'power_on'
+    globals()['_next_reset_kind'] = 'warm' if is_non_power_write_fault else 'power_loss'
+    if globals().get('power_domain') is not None:
+        try:
+            power_domain.StartTrial()
+        except Exception:
+            pass
     reload_images_cached()
     if _hash_bypass_active:
         apply_hash_bypass()
@@ -18851,6 +19178,17 @@ def run_trace_replay_fault(fault_at, fault_type='w'):
     # Phase 1: reconstruct flash state from the clean trace.
     # No machine Reset needed — reload_images_cached() overwrites full flash.
     t_reload = _time.time()
+    _reset_hist_fn = globals().get('_reset_trial_boot_history')
+    if callable(_reset_hist_fn):
+        _reset_hist_fn('power_on')
+    globals()['_trial_boot_reset_kinds'] = ['power_on']
+    globals()['_current_boot_reset_kind'] = 'power_on'
+    globals()['_next_reset_kind'] = 'warm' if is_non_power_write_fault else 'power_loss'
+    if globals().get('power_domain') is not None:
+        try:
+            power_domain.StartTrial()
+        except Exception:
+            pass
     reload_images_cached()
     if (
         backend.get('kind') == 'mram'
@@ -22159,6 +22497,7 @@ if calibration_mode:
         if update_sequence_enabled:
             restore_phase1_baseline()
         else:
+            _reset_trial_boot_history('power_on')
             _machine_reset()
             reload_images()
             apply_pre_boot_state()
@@ -22259,6 +22598,7 @@ if calibration_mode:
             fine_wall_timeout = max(600, int(fine_budget_s * 300))
             log('calibration phase 2: fine trace (slice={}s, budget={}s, max_iters={})'.format(
                 calibration_time_slice, fine_budget_s, fine_max_iters))
+            _reset_trial_boot_history('power_on')
             _machine_reset()
             reload_images()
             apply_pre_boot_state()
@@ -22848,6 +23188,8 @@ else:
         backend['kind'] in ('fast', 'mram')
         and evaluation_mode == 'execute'
         and trace_source_exists
+        and not retained_regions
+        and vbat_present_config is None
     )
 
     if use_trace_replay:
