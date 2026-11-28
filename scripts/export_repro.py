@@ -1741,26 +1741,11 @@ def _synthesize_offline_state(
         if not img_path.is_file():
             continue
         img_bytes = img_path.read_bytes()
-        load_addr = int(load_addrs.get(slot_name, base_addr))
+        load_addr = int(load_addrs[slot_name])
         rel = load_addr - base_addr
         if 0 <= rel < nvm_size:
             end = min(nvm_size, rel + len(img_bytes))
             buf[rel:end] = img_bytes[: end - rel]
-
-    # tests/ota_fault_point.robot defaults ${IMAGE_STAGING} to ${ROOT}/examples/vulnerable_ota/firmware.bin
-    # whenever a profile declares a staging slot without overriding images.staging.
-    default_staging_applied: tuple[int, int, bytes] | None = None
-    if "staging" not in target.profile.images and "staging" in load_addrs:
-        default_staging_path = (repo_root / "examples/vulnerable_ota/firmware.bin").resolve()
-        if default_staging_path.is_file():
-            staging_load_addr = int(load_addrs["staging"])
-            rel = staging_load_addr - base_addr
-            if 0 <= rel < nvm_size:
-                stg_bytes = default_staging_path.read_bytes()
-                end = min(nvm_size, rel + len(stg_bytes))
-                prev_slice = bytes(buf[rel:end])
-                buf[rel:end] = stg_bytes[: end - rel]
-                default_staging_applied = (rel, end, prev_slice)
 
     for entry in getattr(target.profile, "pre_boot_state", None) or ():
         addr = int(entry.address)
@@ -1871,33 +1856,6 @@ def _synthesize_offline_state(
         uncorrectable_words=tuple(("nvm", off) for off in uncorr_offsets),
         persistent_values=pv_bytes,
     )
-
-    # If a synthetic fixture omitted the Robot suite default staging image, check whether reverting it matches
-    if default_staging_applied is not None:
-        exp_sha = (
-            str(fault_snap.get("sha256") or "").strip().lower()
-            if isinstance(fault_snap, dict)
-            else ""
-        )
-        exp_id = str(target.state_identity or "").strip().lower()
-        cur_sha = hashlib.sha256(bytes(buf)).hexdigest().lower()
-        cur_id = state_obj.identity_hex().lower()
-        if (exp_sha and cur_sha != exp_sha) or (exp_id and not cur_id.startswith(exp_id)):
-            s_rel, s_end, prev_slice = default_staging_applied
-            alt_buf = bytearray(buf)
-            alt_buf[s_rel:s_end] = prev_slice
-            alt_obj = PersistentState.from_bytes(
-                alt_buf,
-                name="nvm",
-                base_address=base_addr,
-                uncorrectable_words=tuple(("nvm", off) for off in uncorr_offsets),
-                persistent_values=pv_bytes,
-            )
-            alt_sha = hashlib.sha256(bytes(alt_buf)).hexdigest().lower()
-            alt_id = alt_obj.identity_hex().lower()
-            if (not exp_sha or alt_sha == exp_sha) and (not exp_id or alt_id.startswith(exp_id)):
-                buf = alt_buf
-                state_obj = alt_obj
 
     verified_id = _verify_rebuilt_state_python(
         state_obj,
@@ -2263,7 +2221,7 @@ def _build_recovery_config_dict(
         img_sha = hashlib.sha256(img_path.read_bytes()).hexdigest().lower() if img_path.is_file() else ""
         images_meta[slot_name] = {
             "file": f"firmware/{img_path.name}",
-            "load_address": f"0x{int(load_addrs.get(slot_name, 0)):08X}",
+            "load_address": f"0x{int(load_addrs[slot_name]):08X}",
             "sha256": img_sha,
         }
 

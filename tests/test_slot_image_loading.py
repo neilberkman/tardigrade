@@ -91,3 +91,16 @@ def test_undeclared_staging_reads_as_erased(tmp_path, path, fill):
             "address": f"0x{profile.memory.slots[name].base:08X}",
             "sha256": hashlib.sha256((ROOT / image).read_bytes()).hexdigest(),
         }
+
+
+def test_offline_seed_leaves_undeclared_staging_erased():
+    from types import SimpleNamespace
+
+    from export_repro import _synthesize_offline_state
+
+    profile = load_profile(PROFILE)
+    target = SimpleNamespace(profile=profile, row={}, cuts=(), expected_explanation={}, state_identity=None)
+    state = _synthesize_offline_state(target, ROOT)
+    staging = profile.memory.slots["staging"]
+    offset = staging.base - state.base_address
+    assert state.nvm_bytes[offset:offset + staging.size] == bytes(staging.size)

@@ -914,20 +914,16 @@ def test_export_zephyr_spi_nor_nvs_broken_and_cli_main(tmp_path, capsys):
 
 def test_export_state_matches_emulator_in_all_specified_bytes_and_rejects_diff(tmp_path):
     # 1. MRAM state-search export without embedded _pre_recovery_state:
-    # Offline reconstruction must include the Robot suite default staging image
-    # (examples/vulnerable_ota/firmware.bin at 0x10102000) and match the emulator capture
-    # across all 16,384 bytes (SHA-256 254cdf8b..., state_identity 601330377439...).
+    # The entire second slot retains the zero MRAM erase fill.
     emu_mram = bytearray(0x4000)
     slot_bin = (ROOT / "examples/phase2_mram_parity/slot.bin").read_bytes()
-    vuln_bin = (ROOT / "examples/vulnerable_ota/firmware.bin").read_bytes()
     emu_mram[0 : len(slot_bin)] = slot_bin
-    emu_mram[0x2000 : 0x2000 + len(vuln_bin)] = vuln_bin
     emu_mram[0x0100:0x0110] = bytes.fromhex("314c415654475254314c415654475254")
     emu_mram[0x0118:0x0120] = bytes.fromhex("4f4c443154415445")
     emu_mram[0x0138:0x0140] = bytes.fromhex("3145544147455250")
     emu_mram_bytes = bytes(emu_mram)
     emu_mram_sha = hashlib.sha256(emu_mram_bytes).hexdigest().lower()
-    assert emu_mram_sha == "254cdf8b0e9094bb0cb741ca34c317af008afe7a19ab4e2e8ba15e642a8d99d4"
+    assert emu_mram_sha == "d7e4044dbf6ec8926722fa07b105f30f7a8561bee2930ed560eab146e9624600"
     emu_mram_id = (
         PersistentState.from_bytes(
             emu_mram_bytes,
@@ -938,7 +934,7 @@ def test_export_state_matches_emulator_in_all_specified_bytes_and_rejects_diff(t
         .identity_hex()
         .lower()
     )
-    assert emu_mram_id == "601330377439036885f5929df921e7c6de4d7f4a9e990de02ec0b58ccbf7d0fd"
+    assert emu_mram_id == "de0fc87b6d109586e8124f97b47bb2ca5a3ba0e0bf04a630a94b1167722e484a"
 
     mram_offline_report = {
         "profile": "phase2_mram_deferred_state_search_16_uncorrectable",
@@ -1018,7 +1014,7 @@ def test_export_state_matches_emulator_in_all_specified_bytes_and_rejects_diff(t
     mram_out = tmp_path / "mram_offline_bundle"
     export_reproducer(
         report=mram_rep_path,
-        state="601330377439",
+        state=emu_mram_id[:12],
         output=mram_out,
         renode_test="",
         repo_root=ROOT,
