@@ -725,11 +725,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 return;
             }
 
-            byte newValue = Flash.ReadBytes(changedOffset, 1)[0];
-            byte oldValue = flashShadow[changedOffset];
-
             // Promote to word-aligned for trace recording.
             int aligned = changedOffset & ~3;
+            uint oldWord = FaultTracker.ReadU32(flashShadow, aligned);
             var wordBytes = Flash.ReadBytes(aligned, 4);
             uint wordValue = FaultTracker.ReadU32(wordBytes, 0);
 
@@ -745,13 +743,13 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             if(tracker.RecordWriteAndCheckFault(aligned, wordValue, 4))
             {
                 FaultFired = true;
-                LastFaultAddress = (uint)(FlashBaseAddress + changedOffset);
+                LastFaultAddress = (uint)(FlashBaseAddress + aligned);
 
                 // Snapshot current flash (post-write).
                 FaultFlashSnapshot = Flash.ReadBytes(0, flashLen);
 
                 // Apply the fault.
-                ApplyWriteFault(changedOffset, oldValue, newValue);
+                ApplyWriteFault(aligned, oldWord, wordValue);
             }
         }
 
@@ -770,11 +768,12 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
                 if(off >= 0)
                 {
-                    byte old = preSnap[off];
-                    byte cur = Flash.ReadBytes(off, 1)[0];
-                    LastFaultAddress = (uint)(FlashBaseAddress + off);
+                    int aligned = off & ~3;
+                    uint oldWord = FaultTracker.ReadU32(preSnap, aligned);
+                    uint curWord = FaultTracker.ReadU32(Flash.ReadBytes(aligned, 4), 0);
+                    LastFaultAddress = (uint)(FlashBaseAddress + aligned);
                     FaultFlashSnapshot = Flash.ReadBytes(0, len);
-                    ApplyWriteFault(off, old, cur);
+                    ApplyWriteFault(aligned, oldWord, curWord);
                     flashShadow = null;
                 }
                 else
@@ -864,78 +863,79 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         // Write fault application (post-write, must undo or modify).
         // ---------------------------------------------------------------
 
-        private void ApplyWriteFault(int offset, byte oldValue, byte newValue)
+        private void WriteWordToFlashAndSnapshots(int alignedOffset, uint word)
+        {
+            var bytes = new byte[4];
+            FaultTracker.WriteU32(bytes, 0, word);
+            Flash.WriteBytes(alignedOffset, bytes, 0, 4);
+            if(flashShadow != null && alignedOffset >= 0 && alignedOffset <= flashShadow.Length - 4)
+            {
+                FaultTracker.WriteU32(flashShadow, alignedOffset, word);
+            }
+            if(FaultFlashSnapshot != null && alignedOffset >= 0 && alignedOffset <= FaultFlashSnapshot.Length - 4)
+            {
+                FaultTracker.WriteU32(FaultFlashSnapshot, alignedOffset, word);
+            }
+        }
+
+        private void ApplyWriteFault(int alignedOffset, uint oldWord, uint newWord)
         {
             switch(WriteFaultMode)
             {
-                case 0: // Power-loss: undo the write.
+                case 0: // Power-loss: undo or tear the aligned 32-bit word write.
                 {
-                    var torn = (byte)FaultTracker.BuildFlashTornProgramValue(
-                        oldValue, newValue, 1, EraseFill, TornWordMode,
-                        TornWordSeed, TotalWordWrites, offset);
-                    Flash.WriteByte(offset, torn);
-                    flashShadow[offset] = torn;
-                    FaultFlashSnapshot[offset] = torn;
+                    var torn = (uint)FaultTracker.BuildFlashTornProgramValue(
+                        oldWord, newWord, 4, EraseFill, TornWordMode,
+                        TornWordSeed, TotalWordWrites, alignedOffset);
+                    WriteWordToFlashAndSnapshots(alignedOffset, torn);
                     break;
                 }
                 case 1: // Bit corruption: partial write.
                 {
-                    uint seed = tracker.BuildFaultSeed(offset);
-                    byte keepMask = (byte)(FaultTracker.NextLcg(ref seed) & 0xFF);
-                    byte bitsToFlip = (byte)(oldValue & ~newValue);
-                    byte actuallyFlipped = (byte)(bitsToFlip & keepMask);
-                    byte corrupted = (byte)(oldValue & ~actuallyFlipped);
-                    Flash.WriteByte(offset, corrupted);
-                    flashShadow[offset] = corrupted;
-                    FaultFlashSnapshot[offset] = corrupted;
+                    uint seed = tracker.BuildFaultSeed(alignedOffset);
+                    uint keepMask = FaultTracker.NextLcg(ref seed);
+                    uint bitsToFlip = oldWord & ~newWord;
+                    uint actuallyFlipped = bitsToFlip & keepMask;
+                    uint corrupted = oldWord & ~actuallyFlipped;
+                    WriteWordToFlashAndSnapshots(alignedOffset, corrupted);
                     break;
                 }
                 case 2: // Silent write failure.
                 {
-                    byte silentVal = ((TotalWordWrites & 1UL) == 0UL) ? (byte)0xFF : (byte)0x00;
-                    Flash.WriteByte(offset, silentVal);
-                    flashShadow[offset] = silentVal;
-                    FaultFlashSnapshot[offset] = silentVal;
+                    uint silentVal = ((TotalWordWrites & 1UL) == 0UL) ? 0xFFFFFFFFU : 0x00000000U;
+                    WriteWordToFlashAndSnapshots(alignedOffset, silentVal);
                     break;
                 }
                 case 3: // Write rejection: undo the write.
                 {
-                    Flash.WriteByte(offset, oldValue);
-                    flashShadow[offset] = oldValue;
-                    FaultFlashSnapshot[offset] = oldValue;
+                    WriteWordToFlashAndSnapshots(alignedOffset, oldWord);
                     break;
                 }
                 case 6: // Driver error: reject write and set SR error bit.
                 {
                     DriverErrorFired = true;
-                    Flash.WriteByte(offset, oldValue);
-                    flashShadow[offset] = oldValue;
-                    FaultFlashSnapshot[offset] = oldValue;
+                    WriteWordToFlashAndSnapshots(alignedOffset, oldWord);
                     break;
                 }
                 case 4: // Write-disturb: keep write, corrupt neighbors.
                 {
-                    uint seed = tracker.BuildFaultSeed(offset);
-                    foreach(int nOff in new[] { offset - 1, offset + 1 })
+                    uint seed = tracker.BuildFaultSeed(alignedOffset);
+                    foreach(int nOff in new[] { alignedOffset - 4, alignedOffset + 4 })
                     {
-                        if(nOff < 0 || nOff >= FaultFlashSnapshot.Length)
+                        if(nOff < 0 || FaultFlashSnapshot == null || nOff > FaultFlashSnapshot.Length - 4)
                         {
                             continue;
                         }
-                        byte nb = FaultFlashSnapshot[nOff];
-                        byte disturbMask = (byte)(FaultTracker.NextLcg(ref seed) & 0x11);
-                        byte disturbed = (byte)(nb & ~disturbMask);
-                        Flash.WriteByte(nOff, disturbed);
-                        flashShadow[nOff] = disturbed;
-                        FaultFlashSnapshot[nOff] = disturbed;
+                        uint nb = FaultTracker.ReadU32(FaultFlashSnapshot, nOff);
+                        uint disturbMask = FaultTracker.NextLcg(ref seed) & 0x11111111U;
+                        uint disturbed = nb & ~disturbMask;
+                        WriteWordToFlashAndSnapshots(nOff, disturbed);
                     }
                     break;
                 }
                 default: // Power-loss fallback.
                 {
-                    Flash.WriteByte(offset, oldValue);
-                    flashShadow[offset] = oldValue;
-                    FaultFlashSnapshot[offset] = oldValue;
+                    WriteWordToFlashAndSnapshots(alignedOffset, oldWord);
                     break;
                 }
             }

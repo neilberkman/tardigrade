@@ -115,6 +115,21 @@ STM32F4 Controller Trace Captures First And Second PG Writes
     Should Contain    ${trace}    1:0:1144201745:4
     Should Contain    ${trace}    2:4:2289526357:4
 
+STM32F4 Controller Fault Reverts Full Aligned Word
+    Create STM32F4 Controller Machine
+    Execute Command    sysbus WriteDoubleWord 0x08000000 0xFFFFFFFF
+    Execute Command    faultFlash WriteTraceEnabled true
+    Execute Command    faultFlash FaultAtWordWrite 1
+    Execute Command    sysbus WriteDoubleWord 0x40023C04 0x45670123
+    Execute Command    sysbus WriteDoubleWord 0x40023C04 0xCDEF89AB
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 1
+    Execute Command    sysbus WriteDoubleWord 0x08000000 0x44332211
+    Execute Command    sysbus WriteDoubleWord 0x40023C10 0
+    ${value}=    Execute Command    sysbus ReadDoubleWord 0x08000000
+    ${addr}=     Execute Command    faultFlash LastFaultAddress
+    Should Be Equal As Numbers    ${value}    0xFFFFFFFF
+    Should Be Equal As Numbers    ${addr}     0x08000000
+
 STM32F4 Fast Trace Carries Reconstructed Word Width
     Create STM32F4 Fast Machine
     Execute Command    faultFlash WriteTraceEnabled true

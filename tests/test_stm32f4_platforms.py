@@ -115,3 +115,37 @@ class Stm32f4PlatformTests(unittest.TestCase):
                 self.assertIn("encodedSector >= 16 && encodedSector <= 27", text)
                 self.assertIn("return encodedSector - 4;", text)
                 self.assertIn("return -1;", text)
+
+    def test_f4_controller_aligns_write_faults_to_32bit_trace_words(self) -> None:
+        controller = (ROOT / "peripherals" / "STM32F4FlashController.cs").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "int aligned = changedOffset & ~3;\n"
+            "            uint oldWord = FaultTracker.ReadU32(flashShadow, aligned);",
+            controller,
+        )
+        self.assertIn(
+            "LastFaultAddress = (uint)(FlashBaseAddress + aligned);",
+            controller,
+        )
+        self.assertIn(
+            "ApplyWriteFault(aligned, oldWord, wordValue);",
+            controller,
+        )
+        self.assertIn(
+            "ApplyWriteFault(aligned, oldWord, curWord);",
+            controller,
+        )
+        self.assertIn(
+            "private void ApplyWriteFault(int alignedOffset, uint oldWord, uint newWord)",
+            controller,
+        )
+        self.assertIn(
+            "var torn = (uint)FaultTracker.BuildFlashTornProgramValue(\n"
+            "                        oldWord, newWord, 4, EraseFill, TornWordMode,\n"
+            "                        TornWordSeed, TotalWordWrites, alignedOffset);",
+            controller,
+        )
+        self.assertNotIn("ApplyWriteFault(changedOffset, oldValue, newValue);", controller)
+        self.assertNotIn("oldValue, newValue, 1, EraseFill", controller)
