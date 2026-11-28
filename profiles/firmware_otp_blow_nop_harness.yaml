@@ -25,6 +25,10 @@ memory:
     exec: { base: 0x10000000, size: 0x38000 }
     staging: { base: 0x10038000, size: 0x38000 }
 
+# The state-mode clean control copies these vectors from staging into exec.
+images:
+  staging: examples/vulnerable_ota/firmware.bin
+
 success_criteria:
   marker_address: 0x20010000
   marker_value: 0x00000001
