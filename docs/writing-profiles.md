@@ -2195,14 +2195,14 @@ flash walk of 24,000 four-byte cuts, including identity calculation, measured
 27,779 computed states/second. Recovery boots, rather than identity hashing,
 remain the dominant cost.
 
-New states are visited breadth-first: ascending first-cut index, then trace
-order for each boot. A newly booted state below the configured depth contributes
+New states are visited breadth-first by default (`state_search.order: breadth_first`): ascending first-cut index, then trace
+order for each boot. When recovery code coverage is enabled, `state_search.order: coverage_guided` can instead prioritize parent states whose recovery boots reached new or productive basic-block paths, and `state_search.max_boots_without_new_coverage` can stop the search after a configured number of consecutive recovery boots without new coverage (see [Recovery coverage](#recovery-coverage)). A newly booted state below the configured depth contributes
 its own recovery trace, so `max_cuts: 3` computes a third cut by the same rule.
 Terminal-generation boots skip unused trace capture. Larger values are accepted
 up to eight, but the number of reachable states and recovery boots is the
 practical limit. `max_new_states` bounds unique recovery boots and
 `max_wall_time_s` bounds the batch. The summary reports candidates omitted by
-the boot, time, depth, and address limits. Deferred searches also report
+the boot, time, coverage-plateau, depth, and address limits. Deferred searches also report
 `recovery_boots_reaching_deferred_gate` and
 `recovery_boots_before_deferred_gate`.
 
@@ -2430,6 +2430,562 @@ The recovery boot can terminate on an uncorrectable read before it reaches the
 configured second-cut index. Such a point keeps the existing
 `phase2_no_write_at_index` (or `phase2_no_erase_at_index`) skip reason, while
 its recovery-boot uncorrectable-read telemetry remains available.
+
+#### Recovery coverage
+
+`recovery_coverage` records which basic blocks, functions, and (when DWARF
+`.debug_line` tables are present) source lines in the bootloader's recovery
+scope execute during the clean control boot and each fault-injected recovery
+boot. It is off by default (`enabled: false` when omitted) and requires
+`fault_sweep.mode: runtime` with effective `evaluation_mode: execute`. You can
+place the block either at `fault_sweep.recovery_coverage` or nested at
+`fault_sweep.phase2_fault.state_search.recovery_coverage` (configuring both in
+the same resolved profile is rejected).
+
+Minimal profile fragment enabling recovery coverage on an execute-mode sweep:
+
+```yaml
+fault_sweep:
+  evaluation_mode: execute
+  recovery_coverage:
+    functions: [Reset_Handler, HardFault_Handler]
+```
+
+Combining recovery coverage with `coverage_guided` state search and a plateau
+stop condition (`examples/phase2_mram_parity/profile_state_search_coverage.yaml`):
+
+```yaml
+base_profile: profile_state_search.yaml
+name: phase2_mram_state_search_coverage
+description: Coverage-guided recovery-state search with per-function and per-line recovery coverage.
+fault_sweep:
+  recovery_coverage:
+    functions: [Reset_Handler, HardFault_Handler]
+  phase2_fault:
+    state_search:
+      order: coverage_guided
+      max_boots_without_new_coverage: 4
+```
+
+##### Profile keys and defaults
+
+Under `fault_sweep.recovery_coverage` (or
+`fault_sweep.phase2_fault.state_search.recovery_coverage`; unknown keys are
+rejected):
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` when mapping is omitted; `true` when mapping is present | Enables static scope resolution and per-boot coverage recording. Requires `fault_sweep.mode: runtime` and effective `evaluation_mode: execute`. |
+| `functions` | `[]` | List of non-empty function symbol queries matched against `.symtab` `STT_FUNC` entries in `bootloader.elf`. |
+| `source_files` | `[]` | List of non-empty source-file queries matched against DWARF `.debug_line` entries in `bootloader.elf`. |
+| `address_ranges` | `[]` | List of `{start: <int>, end: <int>}` inclusive bus-address mappings (`0 <= start <= end <= 0xFFFFFFFF`). |
+| `mechanism` | `"oneshot_address_hooks"` | Collection mechanism: `"oneshot_address_hooks"`, `"block_begin_hook"`, or `"execution_tracing"`. |
+
+When `recovery_coverage` is enabled, at least one of `functions`,
+`source_files`, or `address_ranges` must be non-empty.
+
+Under `fault_sweep.phase2_fault.state_search`:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `order` | `"breadth_first"` | Expansion order for state search: `"breadth_first"`, `"coverage_guided"` (requires `recovery_coverage` to be enabled), or `"best_first"`. |
+| `max_boots_without_new_coverage` | `null` | Optional positive integer (`1..1000000`; alias `plateau_boots`, mutually exclusive). Stops state search with `stopped_reason: "coverage_plateau"` when this many consecutive recovery boots reach no new probe PCs. Requires `recovery_coverage` to be enabled; works with both `breadth_first` and `coverage_guided`. |
+
+##### Scope resolution
+
+`build_recovery_coverage_scope` (`scripts/recovery_coverage.py`) resolves the
+configured selectors into half-open Thumb code intervals, in-scope functions,
+basic blocks, and optional DWARF source lines at profile load time:
+
+- **Function queries (`functions`)**: Requires `bootloader.elf` with `STT_FUNC`
+  symbols in `.symtab`. Each defined `STT_FUNC` symbol's entry address has bit 0
+  cleared (`st_value & ~1`); if `st_size == 0`, the symbol's end address is
+  inferred from the next higher function symbol's start address. Compiler clone
+  suffixes (`.constprop.<N>`, `.isra.<N>`, `.part.<N>`, `.cold.<N>`, `.ipa.<N>`,
+  `.modref.<N>`, `. artificial.<N>`) are stripped iteratively when matching. If
+  a query contains glob metacharacters (`*`, `?`, `[`), case-sensitive
+  `fnmatchcase` is tested against both the raw symbol name and its
+  clone-stripped base name. Otherwise a query matches if the raw or
+  clone-stripped symbol equals the query or contains the query as a substring.
+  Whenever a symbol matches, all ELF functions sharing the same clone-stripped
+  base name are included. Every query must match at least one symbol or profile
+  loading fails and lists available function symbols.
+- **Source-file queries (`source_files`)**: Requires `bootloader.elf` with DWARF
+  `.debug_line` information (refused if `.debug_line` is absent). DWARF file
+  paths are normalized with forward slashes relative to the repository root or
+  ELF directory when inside them (or basename for external absolute paths).
+  Queries containing `*`, `?`, or `[` match via `fnmatchcase` against the
+  normalized path or its basename; literal queries match the exact normalized
+  path, exact basename, or a `/<query>` path suffix. Every query must match at
+  least one DWARF line span.
+- **Address ranges (`address_ranges`)**: Each `{start, end}` mapping (inclusive)
+  is aligned to Thumb halfwords as the half-open interval
+  `[start & ~1, max((start & ~1) + 2, (end + 2) & ~1))`. `bootloader.elf` is
+  optional when only `address_ranges` is configured; if `bootloader.elf` is
+  present, overlapping ELF functions, literal pools, basic blocks, and DWARF
+  lines are still resolved, while any active interval not overlapped by an ELF
+  function receives a synthetic function entry named
+  `range_0xXXXXXXXX_0xYYYYYYYY` (`synthetic_range: true`).
+- **Active intervals and basic-block discovery**: All selected intervals are
+  merged into sorted, non-overlapping half-open `active_intervals`. Any ELF
+  function overlapping an active interval is included in `functions` (duplicate
+  static symbol names are disambiguated in `id` as `<name>@0xXXXXXXXX`).
+  Literal pools identified from `$t`/`$d` ELF mapping symbols and PC-relative
+  literal loads (`LDR Rt, [PC, #imm]`, `LDR.W Rt, [PC, #+-imm12]`,
+  `LDRD Rt, Rt2, [PC, #+-imm8*4]`) are excluded. Remaining code is disassembled
+  as M-class Thumb (using Capstone when installed, or the built-in pure-Python
+  Thumb-1/Thumb-2 decoder) and partitioned into basic blocks at chunk starts,
+  function entries, instructions immediately following branches or PC-writing
+  instructions (`b`, `bl`, `blx`, `bx`, `bxj`, `b<cond>`, `cbz`, `cbnz`, `tbb`,
+  `tbh`, `it*`, and `pop`/`ldm`/`ldr`/`mov`/`add`/`sub` writing `pc`), and
+  in-chunk immediate branch targets. Any leader landing on the second halfword
+  of a 32-bit Thumb-2 instruction is snapped back to that instruction's start
+  PC. The sorted unique basic-block start addresses (with bit 0 cleared) form
+  `probe_pcs`.
+- **Granularity**: When DWARF `.debug_line` spans overlap the active scope,
+  `line_info_available` is `true`, `granularity` is `"function_and_line"`, and
+  each `file:line` entry is linked to the `probe_pcs` of basic blocks
+  overlapping its clipped spans. When the ELF lacks `.debug_line`,
+  `line_info_available` is `false`, `granularity` is `"function_only"`,
+  `lines` is `[]`, `line_summary` is `null`, and `line_info_notice` explains
+  that coverage is reported per function only.
+
+##### Collection mechanisms on Renode 1.17.0 and 1.16.1
+
+All three `mechanism` values run on both Renode 1.17.0 (.NET 8) and Renode
+1.16.1 (Mono / IronPython 2.7); `scripts/recovery_coverage.py` is kept
+compatible with both Python 3 on the host and IronPython 2.7 inside Renode
+1.16.1:
+
+1. `oneshot_address_hooks` (default): Before each recorded boot, registers a
+   CPU address hook (`cpu.AddHook(pc, callback)`) at every basic-block leader in
+   `probe_pcs`. On its first hit, the callback records `pc & ~1` and immediately
+   calls `cpu.RemoveHook(pc, callback)` so loops and repeatedly called helpers
+   fire the Python callback at most once per basic block per boot. Any hooks
+   still armed when the boot finishes are removed during teardown. Because a
+   hook is placed at every static basic-block leader (including unbranched
+   fall-through labels and exception handlers), this mechanism records exact
+   static basic-block execution.
+2. `block_begin_hook`: Installs a single `cpu.SetHookAtBlockBegin(delegate)`
+   callback (wrapped in `.NET` `System.Action[UInt64, UInt32]`) before the boot
+   and clears it via `ClearHookAtBlockBegin()` / `SetHookAtBlockBegin(None)` at
+   teardown. The callback records the entry PC (`address & ~1`) of each executed
+   TCG translation block that falls in `probe_pcs` or `active_intervals`, and
+   `resolve_executed_probe_pcs` maps each recorded PC to its containing static
+   basic block. Because Renode only starts a new TCG translation block after a
+   branch or exception rather than at an unbranched fall-through label, a static
+   basic block entered solely by linear fall-through from the preceding block
+   shares the enclosing translation block's start PC and is not reported
+   separately unless branched to directly.
+3. `execution_tracing`: Runs
+   `sysbus.cpu CreateExecutionTracing "cov_tracer" @<trace_path> PC` before the
+   boot and `sysbus.cpu DisableExecutionTracing` at teardown, parses the hex PCs
+   from the temporary trace file, maps them to `probe_pcs`, and deletes the
+   file. Because it creates and parses an external trace file on every boot and
+   depends on Renode's buffered `ExecutionTracer` file writer, it has higher
+   setup/teardown overhead and can miss instructions executed inside
+   asynchronous bus-fault exception dispatches or at the tail of a boot before
+   teardown.
+
+##### How `coverage_guided` ordering and `max_boots_without_new_coverage` work
+
+When `recovery_coverage` is enabled on a `state_search` campaign:
+
+- **Control-boot seeding**: When the execute-mode clean control boot runs before
+  the search, its executed `probe_pcs` seed `initial_coverage` (`_seen_coverage`
+  and `_seen_signatures`) in `RecoveryStateExplorer`, while
+  `_recovery_coverage_seen` starts empty and tracks probe PCs reached across
+  recovery cut boots.
+- **Generation 1 (first cuts)**: While the calibration frame (`parent is None`)
+  is at the head of `_frames`, selected first cuts are expanded and booted in
+  their canonical calibration trace order, identical to `breadth_first`.
+- **Generation 2 and deeper (`order: coverage_guided`)**: Whenever the pending
+  visit queue `_pending` is empty and a parent recovery trace must be chosen
+  from `_frames` (`_current_cov_parent is None` or the front frame belongs to a
+  different parent), `_select_best_coverage_frame` ranks all frames in `_frames`
+  and moves the best parent frame to the front:
+  - Frames whose chain length has already reached `max_cuts` receive key
+    `(-1,)` so their remaining operations are drained immediately into
+    `recovery_operations_excluded_by_max_cuts` without booting.
+  - Each expandable parent node tracks `reached_new` (`1` if the parent boot
+    hit at least one probe PC not previously in `_seen_coverage`),
+    `reached_new_sig` (`1` if the parent boot's full executed PC set had a new
+    SHA-256 coverage signature not in `_seen_signatures`),
+    `has_new_path` (`1` if `reached_new` or `reached_new_sig`),
+    `diverged_from_prior_recovery` (`1` if prior recovery boots existed and the
+    parent hit a probe PC not yet in `_recovery_coverage_seen`),
+    `signature_productive` (`1` if any parent with the same coverage signature
+    has already produced a child boot with `new_coverage_count > 0`),
+    `productive_children` (count of this parent's children that reached new
+    coverage), and `child_stall` (consecutive booted children of this parent
+    with `new_coverage_count == 0`, reset to `0` whenever a child reaches new
+    coverage).
+  - Parents are grouped into six priority tiers (`0` highest to `5` lowest):
+    - **Tier 0**: `has_new_path` and `child_stall == 0`
+    - **Tier 1**: `signature_productive` and `child_stall == 0`
+    - **Tier 2**: `signature_productive` or `productive_children > 0`
+    - **Tier 3**: `has_new_path` (after at least one stalling child and no
+      productive child yet)
+    - **Tier 4**: `child_stall == 0` (routine parent not yet stalled)
+    - **Tier 5**: all remaining parents (`child_stall > 0`, no new path, not
+      productive)
+  - Within a tier, ties are broken deterministically by the 13-tuple:
+    `(tier, -diverged_from_prior_recovery, -reached_new, -reached_new_sig, -sig_unexpanded, -productive_children, child_stall, sig_frequency, min_unit_frequency, -new_coverage_count, children_booted, generation, discovery_ordinal)`,
+    where `sig_unexpanded` prefers a coverage signature that has not yet had any
+    child booted or completed expansion, `sig_frequency` prefers rarer coverage
+    signatures across all boots so far, and `min_unit_frequency` prefers parents
+    whose rarest executed basic block has been seen in the fewest boots.
+  - Once selected, the parent's recovery trace is expanded operation by
+    operation. Candidate states already in `_seen` are recorded as reused
+    (`equivalent_chains`) without switching parents; as soon as a candidate
+    requires a new recovery boot (`will_boot`), that child is booted, its
+    coverage updates the parent's `children_booted`, `productive_children`,
+    `child_stall`, `_expanded_signatures`, and `_productive_signatures`, and
+    `_current_cov_parent` is cleared so the next step re-ranks all active parent
+    frames.
+  - If no budget (`max_new_states`, `max_wall_time_s`,
+    `max_boots_without_new_coverage`) stops the search early, `coverage_guided`
+    visits the exact same set of unique persistent states as `breadth_first`.
+- **Coverage plateau stop (`max_boots_without_new_coverage`)**:
+  - After each recovery boot, if `new_units` (executed probe PCs not yet in
+    `_seen_coverage`) is non-empty, `consecutive_boots_without_new_coverage`
+    resets to `0` and `boots_reaching_new_coverage` increments by `1`; otherwise
+    `consecutive_boots_without_new_coverage` increments by `1`. Reused states do
+    not boot and do not change the counter.
+  - Before booting the next unseen pending candidate (`_needs_boot` is `True`),
+    if `consecutive_boots_without_new_coverage >= max_boots_without_new_coverage`,
+    the search stops with `stopped_reason: "coverage_plateau"` (already-seen
+    candidates at the head of `_pending` can still attach as `equivalent_chains`
+    before the next unseen state triggers the stop).
+  - When stopped on `"coverage_plateau"`, remaining frames in `_frames` are
+    preview-expanded without advancing the checkpoint cursor so known frontier
+    states attach to `equivalent_chains` and unseen frontier states are counted
+    in `states_excluded_by_coverage_plateau` (with
+    `unexpanded_states_at_coverage_plateau` recording the remaining frame
+    count). The search summary sets `complete: false`, and the report verdict is
+    `INCONCLUSIVE -- state search stopped on coverage_plateau`.
+
+##### Merging across multi-cycle boots, resumed searches, and shards
+
+- **Multi-cycle boots (`boot_cycles > 1`)**: For a point with follow-up boot
+  cycles, `_attach_result_recovery_coverage` unions `executed_pcs` across cycle
+  0 and all follow-up cycles and sums `setup_overhead_s`, `callback_overhead_s`,
+  `teardown_overhead_s`, `recording_overhead_s`, `boot_wall_time_s`, and
+  `boots_recorded`.
+- **Resumed searches (`--resume-state-search`)**: When a state search writes a
+  checkpoint, `coverage_state` persists `seen_coverage`,
+  `recovery_coverage_seen`, `unit_first_boot`, `unit_boot_count`,
+  `seen_signatures`, `signature_boot_count`, `expanded_signatures`,
+  `productive_signatures`, `parent_cov`,
+  `consecutive_boots_without_new_coverage`, `discovery_counter`, and
+  `current_cov_parent`. Resuming restores this state alongside the pending
+  frontier so `coverage_guided` parent ranking, plateau counting, and final
+  coverage attribution match an uninterrupted search with the combined budget.
+- **Sharded searches (`shard_count` / `shard_index` and `merge-state-search`)**:
+  Each shard report stores `recovery_coverage_scope` in
+  `state_search_shard.report_context` and per-boot `recovery_coverage` on its
+  `runtime_sweep_results`. Offline merging (`scripts/merge_state_search.py`)
+  verifies that all shards agree on `order` and
+  `max_boots_without_new_coverage`, seeds `initial_coverage` from the control
+  row's `executed_pcs`, replays the search over the union of recorded edges in
+  the configured `order` (`breadth_first` or `coverage_guided`), and recomputes
+  global `recovery_coverage` in the merged visit order. In
+  `summarize_recovery_coverage`, state-search result rows are ordered by
+  `state_search_summary.coverage_by_boot` (`boot_index`) before computing
+  `first_reached_by` and `coverage_by_boot`, so first-hit attribution always
+  reflects actual discovery order even when rows are later sorted by fault
+  point. (For direct Python batch merging via
+  `merge_sharded_coverage_results(shard_batches, scope, control_results=())`,
+  batches are ordered by `shard_index`, duplicate `state_identity` rows are
+  deduplicated with later paths appended to `equivalent_chains`, and the
+  recomputed report includes `recovery_coverage.sharding` with `shards_merged`,
+  `states_deduplicated_across_shards`, and `merged_cut_boots`.)
+
+##### Report section fields and annotated excerpt
+
+When enabled, the aggregated coverage report is attached at both top-level
+`recovery_coverage` and `summary.runtime_sweep.recovery_coverage`, while each
+booted point in `runtime_sweep_results[]` carries its per-boot
+`recovery_coverage` record (and `signals.recovery_coverage_blocks` /
+`signals.recovery_coverage_overhead_s`, plus `recovery_state_search.coverage` on
+state-search rows).
+
+Top-level `recovery_coverage` fields:
+
+- `enabled` (`bool`), `mechanism` (`str`), `granularity`
+  (`"function_and_line"` or `"function_only"`), `line_info_available` (`bool`),
+  and `line_info_notice` (`str` or `null`).
+- `configured_scope`: echo of configured `functions`, `source_files`, and
+  `address_ranges` (`[{start, end}]` formatted as `0xXXXXXXXX`), plus resolved
+  sizing totals `total_probe_pcs`, `total_basic_blocks`, `total_functions`, and
+  `total_lines`.
+- `control_recorded` (`bool`): whether the clean control boot recorded coverage.
+- `cut_boots_recorded` (`int`): number of fault-injected recovery boots with
+  coverage records.
+- `basic_block_summary`: `total`, `executed_by_control_count`,
+  `executed_by_cut_count`, `executed_only_under_cut_count` (probe PCs hit by at
+  least one cut boot but not by the clean control boot), and
+  `never_executed_by_cut_count` (`total - executed_by_cut_count`).
+- `function_summary`: `total`, `executed_by_control_count`,
+  `executed_by_cut_count`, `executed_only_under_cut_count`,
+  `never_executed_by_cut_count`, `never_executed_count` (never executed by
+  either control or any cut boot), `executed_by_control` (list of function
+  `id`s), `executed_only_under_cut` (list of
+  `{function, start_address, first_reached_by}`), and `never_executed_by_cut`
+  (list of function `id`s).
+- `line_summary` (`null` when `line_info_available` is `false`): same counts and
+  lists at DWARF source-line granularity (`executed_only_under_cut` entries have
+  `{line_id, file, line, function, first_reached_by}`).
+- `functions[]`: per-function entries containing `id`, `name`, `start_address`,
+  `end_address`, `size_bytes`, `status` and `classification`
+  (`"executed_by_control"`, `"executed_only_under_cut"`, or
+  `"never_executed_by_cut"`), `cut_status` (`"executed_only_under_cut"`,
+  `"executed_by_control_and_cut"`, `"executed_by_control_only"`, or
+  `"never_executed"`), boolean flags (`executed_by_control`, `executed_by_cut`,
+  `executed_only_under_cut`, `never_executed_by_cut`), `cut_execution_count`
+  (maximum number of cut boots that hit any basic block in the function),
+  `first_reached_by` (point/state descriptor of the first cut boot that entered
+  the function, or `null`), `first_cut_only_block_reached_by` (descriptor of the
+  first cut boot that hit a basic block inside the function that the clean
+  control boot did not execute, or `null`), basic-block counts
+  (`total_basic_blocks`, `control_basic_blocks`, `cut_basic_blocks`,
+  `cut_only_basic_blocks`, `uncovered_basic_blocks`), and
+  `uncovered_block_addresses` (`0xXXXXXXXX` leader addresses of basic blocks in
+  the function never executed by any cut boot).
+- `lines[]` (`[]` when `line_info_available` is `false`): per-line entries with
+  `id` (`file:line`), `file`, `line`, `function`, `functions`, `start_address`,
+  `end_address`, `status`, `classification`, `cut_status`, boolean flags,
+  `cut_execution_count`, and `first_reached_by`.
+- `coverage_by_boot[]`: one entry per cut boot in visit order (`boot_index`
+  starting at `1`, `label`, `kind` (`"state"` or `"point"`), `fault_at`,
+  `fault_type`, `operation_kind`, `boot_executed_units`, `new_units` relative to
+  prior cut boots, `cumulative_units`, `cumulative_functions`,
+  `cumulative_lines` when line info is available,
+  `consecutive_boots_without_new_coverage`, `state_identity` / `generation` /
+  `chain` on state-search runs, and `recording_overhead_s`).
+- `boots_reaching_new_coverage` (`int`) and
+  `max_consecutive_boots_without_new_coverage` (`int`) across the cut-boot
+  sequence.
+- `recording_overhead`: `mechanism`, `boots_measured` (control + cut boots with
+  timing samples), `total_recording_overhead_s`, `mean_recording_overhead_s`,
+  `max_recording_overhead_s`, `mean_boot_emulation_s`, and `overhead_ratio`
+  (`mean_recording_overhead_s / mean_boot_emulation_s`).
+- `state_search` (present when `recovery_state_search` ran): echoes `order`,
+  `max_boots_without_new_coverage`, `stopped_reason`, `states_booted`,
+  `coverage_units_reached`, `boots_reaching_new_coverage`, and
+  `states_excluded_by_coverage_plateau`.
+
+Annotated excerpt from a real run of
+`examples/phase2_mram_parity/profile_state_search_coverage.yaml`:
+
+```jsonc
+{
+  "recovery_coverage": {
+    "enabled": true,
+    "mechanism": "oneshot_address_hooks",
+    "granularity": "function_and_line",          // DWARF .debug_line is present in firmware.elf
+    "line_info_available": true,
+    "line_info_notice": null,
+    "configured_scope": {
+      "address_ranges": [],
+      "functions": ["Reset_Handler", "HardFault_Handler"],
+      "source_files": [],
+      "total_basic_blocks": 14,                  // 1 block in HardFault_Handler + 13 in Reset_Handler
+      "total_functions": 2,
+      "total_lines": 19,
+      "total_probe_pcs": 14
+    },
+    "control_recorded": true,
+    "cut_boots_recorded": 4,                     // 4 unique persistent states booted across generations 1..2
+    "basic_block_summary": {
+      "total": 14,
+      "executed_by_control_count": 9,            // Clean control boot hits 9 of 13 blocks in Reset_Handler
+      "executed_by_cut_count": 10,               // Recovery boots hit 9 blocks in Reset_Handler + 1 in HardFault_Handler
+      "executed_only_under_cut_count": 2,        // 0x10000014 (HardFault_Handler) and 0x1000006C (repair branch)
+      "never_executed_by_cut_count": 4           // 4 blocks in Reset_Handler never executed during recovery boots
+    },
+    "function_summary": {
+      "total": 2,
+      "executed_by_control_count": 1,
+      "executed_by_cut_count": 2,
+      "executed_only_under_cut_count": 1,
+      "never_executed_by_cut_count": 0,
+      "never_executed_count": 0,
+      "executed_by_control": ["Reset_Handler"],
+      "executed_only_under_cut": [
+        {
+          "function": "HardFault_Handler",       // Reached only when reading an uncorrectable MRAM word under cut
+          "start_address": "0x10000014",
+          "first_reached_by": {
+            "boot_index": 1,
+            "chain": "write[0]@0x10100100",
+            "fault_at": 0,
+            "fault_type": "rs",
+            "generation": 1,
+            "kind": "state",
+            "label": "write[0]@0x10100100",
+            "operation_kind": "program",
+            "state_identity": "20d4e2b8d5f9742aa0643fe8f9777ccfaa8bc782e707537badef22fa78f1083c"
+          }
+        }
+      ],
+      "never_executed_by_cut": []
+    },
+    "functions": [
+      {
+        "id": "HardFault_Handler",
+        "name": "HardFault_Handler",
+        "start_address": "0x10000014",
+        "end_address": "0x10000022",
+        "size_bytes": 14,
+        "status": "executed_only_under_cut",
+        "cut_status": "executed_only_under_cut",
+        "cut_execution_count": 4,
+        "total_basic_blocks": 1,
+        "control_basic_blocks": 0,
+        "cut_basic_blocks": 1,
+        "cut_only_basic_blocks": 1,
+        "uncovered_basic_blocks": 0,
+        "uncovered_block_addresses": []
+      },
+      {
+        "id": "Reset_Handler",
+        "name": "Reset_Handler",
+        "start_address": "0x10000024",
+        "end_address": "0x100000EC",
+        "size_bytes": 200,
+        "status": "executed_by_control",
+        "cut_status": "executed_by_control_and_cut",
+        "cut_execution_count": 4,
+        "total_basic_blocks": 13,
+        "control_basic_blocks": 9,
+        "cut_basic_blocks": 9,
+        "cut_only_basic_blocks": 1,              // Repair block 0x1000006C ran only on cut boots
+        "uncovered_basic_blocks": 4,
+        "uncovered_block_addresses": [
+          "0x1000003C",                          // Initial update-request branch (only runs in Phase 1 / control)
+          "0x10000092",                          // HOOK_ADDRESS second-word check
+          "0x10000098",                          // HOOK_SEEN_MARKER store branch
+          "0x100000AA"                           // Trailing alignment nop after infinite wfi loop
+        ]
+      }
+    ],
+    "coverage_by_boot": [
+      {
+        "boot_index": 1,
+        "chain": "write[0]@0x10100100",
+        "generation": 1,
+        "boot_executed_units": 9,
+        "new_units": 9,
+        "cumulative_units": 9,
+        "cumulative_functions": 2,
+        "cumulative_lines": 15,
+        "consecutive_boots_without_new_coverage": 0,
+        "recording_overhead_s": 0.021141
+      },
+      {
+        "boot_index": 2,
+        "chain": "write[2]@0x10100108",
+        "generation": 1,
+        "boot_executed_units": 9,
+        "new_units": 0,
+        "cumulative_units": 9,
+        "cumulative_functions": 2,
+        "cumulative_lines": 15,
+        "consecutive_boots_without_new_coverage": 1,
+        "recording_overhead_s": 0.002609
+      },
+      {
+        "boot_index": 3,
+        "chain": "write[0]@0x10100100 -> write[3]@0x10100108",
+        "generation": 2,
+        "boot_executed_units": 10,
+        "new_units": 1,                          // Reaches 0x10000064 when first word matches and second word is torn
+        "cumulative_units": 10,
+        "cumulative_functions": 2,
+        "cumulative_lines": 15,
+        "consecutive_boots_without_new_coverage": 0,
+        "recording_overhead_s": 0.002342
+      },
+      {
+        "boot_index": 4,
+        "chain": "write[2]@0x10100108 -> write[0]@0x10100100",
+        "generation": 2,
+        "boot_executed_units": 9,
+        "new_units": 0,
+        "cumulative_units": 10,
+        "cumulative_functions": 2,
+        "cumulative_lines": 15,
+        "consecutive_boots_without_new_coverage": 1,
+        "recording_overhead_s": 0.002373
+      }
+    ],
+    "boots_reaching_new_coverage": 2,
+    "max_consecutive_boots_without_new_coverage": 1,
+    "recording_overhead": {
+      "mechanism": "oneshot_address_hooks",
+      "boots_measured": 5,                       // 1 control boot + 4 unique state-search cut boots
+      "total_recording_overhead_s": 0.044937,
+      "mean_recording_overhead_s": 0.008987,
+      "max_recording_overhead_s": 0.021141,
+      "mean_boot_emulation_s": 0.157413,
+      "overhead_ratio": 0.057094
+    },
+    "state_search": {
+      "order": "coverage_guided",
+      "max_boots_without_new_coverage": 4,
+      "stopped_reason": "complete",
+      "states_booted": 4,
+      "coverage_units_reached": 10,
+      "boots_reaching_new_coverage": 2,
+      "states_excluded_by_coverage_plateau": 0
+    }
+  }
+}
+```
+
+##### Limits and run-time cost
+
+- **What recovery coverage does not measure**:
+  - It measures basic-block entry execution (`probe_pcs`) within the configured
+    scope during the clean control boot and fault-injected recovery boots. It
+    does not record Phase 1 pre-cut execution (the initial update boot before
+    power loss), calibration runs, live trace-replay cross-check boots, or
+    `evaluation_mode: state` runs (which are refused).
+  - It records basic-block reachability, not branch-condition/edge/MC-DC
+    coverage, path coverage, or data-value coverage.
+  - Because `oneshot_address_hooks` disarms each basic-block hook on its first
+    hit in a boot, `cut_execution_count` counts how many distinct *cut boots*
+    executed a block, function, or line, not the intra-boot loop iteration
+    count.
+  - Reused states in `state_search` that hit the verdict cache do not boot the
+    CPU again and do not add entries to `coverage_by_boot`.
+  - Code outside the configured `functions`, `source_files`, and
+    `address_ranges` is ignored. When `bootloader.elf` lacks DWARF
+    `.debug_line`, source-line coverage (`lines`, `line_summary`) is unavailable
+    and the report falls back to `granularity: "function_only"`.
+  - `block_begin_hook` only observes TCG translation-block entry PCs (missing
+    static basic-block boundaries entered purely by linear fall-through), and
+    `execution_tracing` relies on Renode's buffered trace file writer (which can
+    miss instructions inside asynchronous bus-fault exception dispatches or at
+    the end of a boot before teardown).
+- **Run-time cost**:
+  - At profile load time, `build_recovery_coverage_scope` parses `.symtab`,
+    DWARF `.debug_line`, and disassembles the active intervals once.
+  - At runtime on `examples/phase2_mram_parity/profile_state_search_coverage.yaml`
+    (14 probe PCs, 5 measured boots: 1 control + 4 recovery states),
+    `oneshot_address_hooks` adds `~0.009 s` mean recording overhead per boot on
+    Renode 1.17.0 (`0.045 s` total across 5 boots, `overhead_ratio: 0.057`) and
+    `~0.013 s` mean per boot on Renode 1.16.1 (`0.065 s` total,
+    `overhead_ratio: 0.065`). `block_begin_hook` adds `~0.008–0.010 s` mean per
+    boot (`overhead_ratio: 0.050–0.053`).
+  - `execution_tracing` creates, parses, and deletes a temporary PC trace file on
+    every boot, costing `~0.161 s` mean per boot on Renode 1.17.0 (`0.805 s`
+    total, `overhead_ratio: 0.678`) and `~0.186 s` mean per boot on Renode
+    1.16.1 (`0.930 s` total, `overhead_ratio: 0.654`).
+  - For `oneshot_address_hooks`, per-boot hook setup and teardown scale with
+    `total_probe_pcs`; scoping `functions`, `source_files`, or `address_ranges`
+    to the bootloader's recovery path keeps the hook count and overhead low.
 
 ### Multi-fault sweeps
 
@@ -2963,6 +3519,8 @@ summary.runtime_sweep.point_counts
   .calibration.program                  -- calibrated writes and their direct/represented coverage
   .calibration.erase                    -- calibrated erases and their direct/represented coverage
 summary.runtime_sweep.timing            -- per-phase timing breakdown
+summary.runtime_sweep.recovery_coverage -- aggregated recovery code coverage report (also mirrored at top-level recovery_coverage)
+recovery_coverage                       -- top-level recovery code coverage summary, per-function/per-line attribution, and uncovered basic blocks
 runtime_sweep_results[]                 -- per-point detail
   .fault_at                             -- which write or erase was faulted
   .fault_type                           -- wire code ("w", "e", "b", "p2:...", etc.)
@@ -2970,12 +3528,20 @@ runtime_sweep_results[]                 -- per-point detail
   .boot_outcome                         -- success/wrong_image/no_boot/...
   .fault_class                          -- recoverable/wrong_image/unrecoverable
   .signals                              -- raw harness signals (VTOR, markers, etc.)
+  .recovery_coverage                    -- (when recovery_coverage is enabled) per-boot executed probe PCs and recording overhead
   .mram_fault_evidence                  -- exact program/erase bytes, address, width/size, uncorrectable marks, trace
   .fault_snapshot                       -- immediate digest, closest image, byte ranges
   .fault_snapshot_file                  -- raw immediate persistent-memory snapshot
   .postmortem_partition_dump            -- (no_boot only) slot header/trailer data
   .resume_trace                         -- (no_boot only) PC samples from second boot
 ```
+
+When `fault_sweep.recovery_coverage` is enabled, `recovery_coverage` (and
+`summary.runtime_sweep.recovery_coverage`) reports `basic_block_summary`,
+`function_summary`, `line_summary`, `functions[]` (including
+`uncovered_basic_blocks` and `uncovered_block_addresses`), `lines[]`,
+`coverage_by_boot[]`, `recording_overhead`, and `state_search` coverage progression;
+see [Recovery coverage](#recovery-coverage) for the field-by-field reference.
 
 The ordered `<kind>` identifiers are `single_cut_program`,
 `single_cut_erase`, `state_search_single_cut`,

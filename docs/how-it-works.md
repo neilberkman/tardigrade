@@ -205,6 +205,7 @@ In `execute` mode, Phase 2 performs a full CPU recovery boot from faulted NVM:
 - **Sticky fault signal** (`FaultEverFired`) survives subsequent writes and resets.
 - **Write stabilization early-exit** reduces per-point runtime when writes settle.
 - **No-boot introspection** emits partition post-mortem dumps and per-operation PC traces for `no_boot` outcomes.
+- **Recovery code coverage and search ordering** (`fault_sweep.recovery_coverage`) optionally records which bootloader basic blocks, functions, and DWARF source lines execute during the clean control boot and each recovery boot, and can drive `state_search.order: coverage_guided` expansion and `max_boots_without_new_coverage` plateau stopping (see [Recovery-state search](writing-profiles.md#recovery-state-search) and [Recovery coverage](writing-profiles.md#recovery-coverage)).
 
 ## Performance
 
@@ -247,4 +248,4 @@ evidence also requires calibration coverage: if the bootloader never moves
 slot data during calibration, tardigrade reports an incomplete setup rather
 than claiming the bootloader is clean.
 
-See **[`docs/writing-profiles.md`](writing-profiles.md)** for the full report JSON structure and how to interpret results.
+See **[`docs/writing-profiles.md`](writing-profiles.md)** for the full report JSON structure (including the [`recovery_coverage`](writing-profiles.md#recovery-coverage) and [`report JSON structure`](writing-profiles.md#report-json-structure) sections) and how to interpret results.
