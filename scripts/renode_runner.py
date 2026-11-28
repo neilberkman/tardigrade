@@ -156,6 +156,13 @@ def prepare_renode_command(
         "--platform",
         platform,
     ]
+    if "DEBUG_MODE:true" in container_args:
+        for arg in container_args:
+            if arg.startswith("DEBUG_GDB_PORT:"):
+                raw_port = arg.split(":", 1)[1].strip()
+                if raw_port.isdigit() and int(raw_port) > 0:
+                    cmd.extend(["-p", "{}:{}".format(raw_port, raw_port)])
+                break
     for mount_dir in sorted(mount_dirs.keys()):
         cmd.extend(["-v", "{}:{}".format(mount_dir, mount_dir)])
     for key, value in forwarded_env:

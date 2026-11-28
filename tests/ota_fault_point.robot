@@ -156,6 +156,14 @@ ${DURABILITY_MODEL}            direct
 ${WRITEBACK_BUFFER_CAPACITY}   auto
 ${WRITEBACK_BARRIERS}          ${EMPTY}
 ${WRITEBACK_ERASE_FLUSHES}     false
+${DEBUG_MODE}                  false
+${DEBUG_STOP_AT}               recovery-reset
+${DEBUG_GDB_PORT}              3333
+${DEBUG_READY_FILE}            ${EMPTY}
+${DEBUG_TIMEOUT_S}             300
+${DEBUG_EXPECTED_STATE_ID}     ${EMPTY}
+${DEBUG_EXPECTED_STATE_FILE}    ${EMPTY}
+${DEBUG_STATE_SEARCH_GATED}    false
 ${TEST_TIMEOUT}                2 minutes
 
 *** Keywords ***
@@ -355,6 +363,14 @@ Run Runtime Fault Point
     Execute Command    $writeback_buffer_capacity="${WRITEBACK_BUFFER_CAPACITY}"
     Execute Command    $writeback_barriers="${WRITEBACK_BARRIERS}"
     Execute Command    $writeback_erase_flushes="${WRITEBACK_ERASE_FLUSHES}"
+    Execute Command    $debug_mode="${DEBUG_MODE}"
+    Execute Command    $debug_stop_at="${DEBUG_STOP_AT}"
+    Execute Command    $debug_gdb_port="${DEBUG_GDB_PORT}"
+    Execute Command    $debug_ready_file="${DEBUG_READY_FILE}"
+    Execute Command    $debug_timeout_s="${DEBUG_TIMEOUT_S}"
+    Execute Command    $debug_expected_state_id="${DEBUG_EXPECTED_STATE_ID}"
+    Execute Command    $debug_expected_state_file="${DEBUG_EXPECTED_STATE_FILE}"
+    Execute Command    $debug_state_search_gated="${DEBUG_STATE_SEARCH_GATED}"
 
     Execute Script    ${ROOT}/scripts/run_runtime_fault_sweep.resc
 

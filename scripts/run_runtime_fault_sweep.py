@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -45,7 +46,7 @@ from recovery_state import (
     apply_interrupted_operation,
     merge_operation_traces,
 )
-from recovery_checkpoint import json_digest
+from recovery_checkpoint import json_digest, restore_snapshots
 from recovery_search import (
     RecoveryStateExplorer,
     first_persistent_difference,
@@ -697,6 +698,28 @@ trace_replay_cross_check_every = get_optional_int_var(
 if trace_replay_cross_check_every < 0:
     raise Exception('trace_replay_cross_check_every must be non-negative')
 
+debug_mode = (
+    get_optional_var('debug_mode', '').strip().lower()
+    in ('1', 'true', 'yes', 'on')
+)
+debug_stop_at = (
+    get_optional_var('debug_stop_at', 'recovery-reset').strip().lower()
+    or 'recovery-reset'
+)
+debug_gdb_port = get_optional_int_var('debug_gdb_port', 3333)
+debug_ready_file = get_optional_var('debug_ready_file', '').strip()
+debug_timeout_s = get_optional_int_var('debug_timeout_s', 300)
+debug_expected_state_id = (
+    get_optional_var('debug_expected_state_id', '').strip().lower()
+)
+debug_expected_state_file = (
+    get_optional_var('debug_expected_state_file', '').strip()
+)
+debug_state_search_gated = (
+    get_optional_var('debug_state_search_gated', '').strip().lower()
+    in ('1', 'true', 'yes', 'on')
+)
+
 
 def _apply_torn_word_mode():
     """Apply the backend-neutral flash cut outcome when explicitly configured."""
@@ -1165,6 +1188,12 @@ def refresh_runtime_handles():
     global backend, bus, console_peripherals, console_peripheral_names
     bus = monitor.Machine.SystemBus
     backend['data'] = monitor.Machine[backend['backend_sysbus_name']]
+    companion_nvmc = getattr(backend['data'], 'CompanionNvmc', None)
+    if companion_nvmc is not None and hasattr(backend['data'], 'Tracker'):
+        try:
+            companion_nvmc.SharedTracker = backend['data'].Tracker
+        except Exception:
+            pass
     _apply_mram_torn_word_mode()
     if (
         backend.get('kind') == 'mram'
@@ -7357,6 +7386,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
             b['data'].LastFaultPC = 0
         if hasattr(b['data'], 'LastFaultCallContext'):
             b['data'].LastFaultCallContext = ''
+        if hasattr(b['data'], 'FaultFlashSnapshot'):
+            b['data'].FaultFlashSnapshot = None
         if hasattr(b['data'], 'PassthroughMode'):
             b['data'].PassthroughMode = False
     elif b['kind'] == 'fast':
@@ -7382,6 +7413,8 @@ def reset_nvmc_for_sweep(tracking_start=None):
         # shadow scanning adds 1MB ReadBytes per write with no accuracy benefit.
         if getattr(b['data'], 'PerWriteAccurate', False):
             b['data'].SkipShadowScan = True
+            if hasattr(b['data'], 'InvalidateShadow'):
+                b['data'].InvalidateShadow()
         else:
             b['data'].SkipShadowScan = False
             b['data'].InvalidateShadow()
@@ -7400,6 +7433,10 @@ def reset_nvmc_for_sweep(tracking_start=None):
             b['data'].Nvm.EraseFaultMode = 0
         if hasattr(b['data'].Nvm, 'LastFaultAddress'):
             b['data'].Nvm.LastFaultAddress = 0
+        if hasattr(b['data'].Nvm, 'FaultFlashSnapshot'):
+            b['data'].Nvm.FaultFlashSnapshot = None
+        if hasattr(b['data'], 'FaultFlashSnapshot'):
+            b['data'].FaultFlashSnapshot = None
         if hasattr(b['data'].Nvm, 'LastFaultPC'):
             b['data'].Nvm.LastFaultPC = 0
         if hasattr(b['data'].Nvm, 'LastFaultCallContext'):
@@ -7733,9 +7770,17 @@ def restore_flash_and_boot(saved_flash):
     if b['kind'] == 'mram':
         # MRAMMemory may or may not survive machine Reset depending on
         # vtable dispatch.  Always restore to be safe.
-        b['data'].WriteBytes(0, saved_flash, 0, len(saved_flash))
+        restore_raw = getattr(b['data'], 'RestoreSnapshotRaw', None)
+        if restore_raw is not None:
+            restore_raw(saved_flash)
+        else:
+            b['data'].WriteBytes(0, saved_flash, 0, len(saved_flash))
     elif b['kind'] == 'slow':
-        b['data'].Nvm.WriteBytes(0, saved_flash, 0, len(saved_flash))
+        restore_raw = getattr(b['data'].Nvm, 'RestoreSnapshotRaw', None)
+        if restore_raw is not None:
+            restore_raw(saved_flash)
+        else:
+            b['data'].Nvm.WriteBytes(0, saved_flash, 0, len(saved_flash))
     else:
         flash_ref = b['data'].Flash
         flash_ref.WriteBytes(0, saved_flash)
@@ -13843,7 +13888,9 @@ def _build_fault_result(fault_at, fault_type, fault_injected, fault_address,
     return result
 
 
-def _encode_pre_recovery_state(snapshot_bytes, uncorrectable_words=None):
+def _encode_pre_recovery_state(
+    snapshot_bytes, uncorrectable_words=None, persistent_values=None
+):
     if not snapshot_bytes:
         return None
     try:
@@ -13858,6 +13905,23 @@ def _encode_pre_recovery_state(snapshot_bytes, uncorrectable_words=None):
         }
         if uncorrectable_words:
             payload['uncorrectable_words'] = list(uncorrectable_words)
+        pv_source = persistent_values
+        if pv_source is None:
+            otp_dev = backend.get('otp')
+            if otp_dev is not None and hasattr(otp_dev, 'TestSnapshot'):
+                try:
+                    pv_source = {'otp': otp_dev.TestSnapshot()}
+                except Exception:
+                    pv_source = None
+        if isinstance(pv_source, dict) and pv_source:
+            encoded_pv = {}
+            for name, val in pv_source.items():
+                if val is None:
+                    continue
+                val_bytes = bytes(bytearray(to_py_bytes(val)))
+                encoded_pv[str(name)] = _b64.b64encode(val_bytes).decode('ascii')
+            if encoded_pv:
+                payload['persistent_values'] = encoded_pv
         return payload
     except Exception:
         return None
@@ -15413,11 +15477,18 @@ def run_cascading_fault(write_fault_at, erase_fault_at):
 def _phase2_chain_snapshot():
     """Capture persistent state after one explicit chain cut."""
     b = backend
-    if b['kind'] in ('mram', 'otp'):
+    if b['kind'] == 'otp':
         size = int(b['data'].Size)
         flash = b['data'].ReadBytes(0, size)
+    elif b['kind'] == 'mram':
+        size = int(b['data'].Size)
+        flash = getattr(b['data'], 'FaultFlashSnapshot', None)
+        if flash is None:
+            flash = b['data'].ReadBytes(0, size)
     else:
-        flash = b['data'].FaultFlashSnapshot
+        flash = getattr(b['data'], 'FaultFlashSnapshot', None)
+        if flash is None and b['kind'] == 'slow':
+            flash = getattr(b['data'].Nvm, 'FaultFlashSnapshot', None)
         if flash is None:
             flash_ref = (
                 b['data'].Nvm
@@ -15670,6 +15741,7 @@ def _phase2_chain_evaluated_result(
         _chain_pre_state = _encode_pre_fn(
             to_py_bytes(snapshot['flash']),
             snapshot.get('uncorrectable_addresses'),
+            snapshot.get('persistent_values'),
         )
         if _chain_pre_state is not None:
             result['_pre_recovery_state'] = _chain_pre_state
@@ -20234,7 +20306,7 @@ def _dispatch_fault_point(fp, ft, default_run_fn):
 # by LoadBinary need the fill.  Reload images after fill to restore them.
 # ---------------------------------------------------------------------------
 _writeback_preflight_before_machine_writes = None
-if (not calibration_mode and writeback_active()
+if (not calibration_mode and not debug_mode and writeback_active()
         and _writeback_preflight_needed(fault_points)):
     # Reject provenance before the first runtime reload/write.  Dispatch also
     # checks this defensively, but a bad trace must not reach execute fallback
@@ -20322,6 +20394,1749 @@ def _calibration_trace_target():
     if backend['kind'] == 'slow':
         return getattr(data, 'Nvm', None)
     return data
+
+
+def _debug_write_ready_payload(payload):
+    if not debug_ready_file:
+        return
+    tmp_path = debug_ready_file + '.tmp'
+    with open(tmp_path, 'w') as rf:
+        rf.write(_json_dump_text(payload))
+    if os.path.exists(debug_ready_file):
+        try:
+            os.remove(debug_ready_file)
+        except Exception:
+            pass
+    os.rename(tmp_path, debug_ready_file)
+
+
+def _debug_persistent_state_from_snapshot(snapshot):
+    flash_base, _flash_size, _page_size, _erase_fill = (
+        _replay_storage_geometry()
+    )
+    observed_values = dict(
+        (name, bytearray(to_py_bytes(value)))
+        for name, value in snapshot.get('persistent_values', {}).items()
+    )
+    return PersistentState.from_bytes(
+        bytearray(to_py_bytes(snapshot['flash'])),
+        name='nvm',
+        base_address=flash_base,
+        uncorrectable_words=tuple(
+            ('nvm', int(offset))
+            for offset in snapshot.get('uncorrectable_offsets', ())
+        ),
+        persistent_values=observed_values,
+    )
+
+
+def _debug_parse_cuts(fault_at, fault_type):
+    ft = str(fault_type or 'w').strip()
+    if int(fault_at) < 0 or ft == 'control':
+        return []
+    if ft.startswith('p2:'):
+        parts = ft.split(':')
+        p1_at = int(parts[1])
+        p2_at = int(parts[2])
+        p1_type = parts[3] if len(parts) > 3 else 'w'
+        p2_type = parts[4] if len(parts) > 4 else 'w'
+        return [(p1_at, p1_type), (p2_at, p2_type)]
+    if ft.startswith('pc:'):
+        parts = ft.split(':')[1:]
+        if len(parts) < 6 or len(parts) % 2:
+            raise RuntimeError('invalid phase2 fault chain wire encoding')
+        return [
+            (int(parts[idx]), parts[idx + 1])
+            for idx in range(0, len(parts), 2)
+        ]
+    if ft.startswith('c:'):
+        parts = ft.split(':')
+        return [(int(parts[1]), 'w'), (int(parts[2]), 'e')]
+    if ft.startswith('mf:'):
+        mf_points, mf_codes = decode_multi_fault_stages_local(ft)
+        return [
+            (int(pt), str(sc))
+            for pt, sc in zip(mf_points, mf_codes)
+        ]
+    if ft.startswith(('h:', 'cc:')):
+        parts = ft.split(':')
+        cut_idx = int(parts[1]) if len(parts) > 1 else int(fault_at)
+        cut_code = parts[2] if len(parts) > 2 else 'w'
+        return [(cut_idx, cut_code)]
+    return [(int(fault_at), ft)]
+
+
+def _debug_cut_is_reset_boundary(cut_code):
+    code = str(cut_code or 'w').strip()
+    if code.startswith(('m:', 'nv:', 'i:', 'tb:')):
+        return False
+    base = _base_fault_type_code(code)
+    return base in ('w', 'e', 'a', 't', 'op')
+
+
+def _debug_snapshot_from_persistent_state(state):
+    nvm_region = state.region('nvm')
+    nvm_bytes = state.materialize()['nvm']
+    base_addr = int(nvm_region.base_address)
+    offsets = sorted(
+        int(offset)
+        for region_name, offset in state.uncorrectable_words
+        if region_name == 'nvm'
+    )
+    addresses = [fmt_u32(base_addr + off) for off in offsets]
+    persistent_values = dict(
+        (str(name), to_clr_bytes(val))
+        for name, val in dict(state.persistent_values).items()
+    )
+    return {
+        'flash': to_clr_bytes(nvm_bytes),
+        'uncorrectable_offsets': offsets,
+        'uncorrectable_addresses': addresses,
+        'persistent_values': persistent_values,
+    }
+
+
+def _debug_decode_pre_recovery_state_dict(encoded):
+    if not isinstance(encoded, dict) or not encoded.get('zlib_b64'):
+        return None
+    import zlib as _zlib
+    raw = _zlib.decompress(base64.b64decode(encoded['zlib_b64']))
+    base = int(str(encoded.get('base_address', '0')), 0)
+    marks = []
+    for item in encoded.get('uncorrectable_words') or ():
+        addr = int(str(item), 0)
+        if addr >= base:
+            marks.append(('nvm', addr - base))
+    persistent_values = {}
+    for name, val_b64 in (encoded.get('persistent_values') or {}).items():
+        if isinstance(val_b64, str) and val_b64:
+            persistent_values[str(name)] = bytearray(base64.b64decode(val_b64))
+    return PersistentState.from_bytes(
+        bytearray(raw),
+        name='nvm',
+        base_address=base,
+        uncorrectable_words=tuple(marks),
+        persistent_values=persistent_values,
+    )
+
+
+def _debug_load_expected_state_payload(path=None):
+    target_path = debug_expected_state_file if path is None else path
+    if not target_path or not os.path.isfile(target_path):
+        return None, None
+    with open(target_path, 'r') as f:
+        payload = json.loads(f.read())
+    if not isinstance(payload, dict):
+        return None, None
+    preloaded_state = None
+    ckpt_snap = payload.get('checkpoint_snapshot')
+    if isinstance(ckpt_snap, dict) and ckpt_snap.get('snapshots'):
+        restored = restore_snapshots(ckpt_snap)
+        if restored:
+            target_id = str(payload.get('state_identity') or '').strip().lower()
+            if target_id and target_id in restored:
+                preloaded_state = restored[target_id]
+            else:
+                preloaded_state = next(iter(restored.values()))
+    if preloaded_state is None and isinstance(payload.get('pre_recovery_state'), dict):
+        preloaded_state = _debug_decode_pre_recovery_state_dict(
+            payload['pre_recovery_state']
+        )
+    return payload, preloaded_state
+
+
+def _debug_verify_rebuilt_state(
+    rebuilt_state,
+    expected_state_id=None,
+    expected_payload=None,
+    preloaded_state=None,
+):
+    actual_state_id = rebuilt_state.identity_hex().lower()
+    exp_id = str(expected_state_id or '').strip().lower()
+    if not exp_id and isinstance(expected_payload, dict):
+        exp_id = str(expected_payload.get('state_identity') or '').strip().lower()
+    if exp_id and not actual_state_id.startswith(exp_id):
+        raise RuntimeError(
+            'rebuilt persistent state {} does not match expected state {}'.format(
+                actual_state_id, exp_id
+            )
+        )
+
+    nvm_region = rebuilt_state.region('nvm')
+    base_addr = int(nvm_region.base_address)
+    rebuilt_bytes = bytearray(rebuilt_state.materialize()['nvm'])
+    rebuilt_mark_addrs = set(
+        base_addr + int(off)
+        for rname, off in rebuilt_state.uncorrectable_words
+        if rname == 'nvm'
+    )
+
+    rebuilt_pv_map = dict(rebuilt_state.persistent_values)
+
+    if preloaded_state is not None:
+        observed_values = dict(
+            (name, bytearray(val))
+            for name, val in rebuilt_pv_map.items()
+        )
+        diff = first_persistent_difference(
+            preloaded_state,
+            {'nvm': rebuilt_bytes},
+            rebuilt_state.uncorrectable_words,
+            observed_values,
+        )
+        if diff is not None:
+            raise RuntimeError(
+                'rebuilt persistent state differs from expected snapshot at {} '
+                '({}; expected={} observed={})'.format(
+                    diff.get('address', diff.get('name', 'unknown')),
+                    diff.get('kind', 'mismatch'),
+                    diff.get('expected', 'n/a'),
+                    diff.get('observed', 'n/a'),
+                )
+            )
+
+    if not isinstance(expected_payload, dict):
+        return actual_state_id
+
+    explanation = expected_payload.get('expected_explanation')
+    if not isinstance(explanation, dict):
+        return actual_state_id
+
+    fault_snap = explanation.get('fault_snapshot')
+    if isinstance(fault_snap, dict):
+        exp_sha = str(fault_snap.get('sha256') or '').strip().lower()
+        if exp_sha:
+            actual_sha = hashlib.sha256(bytes(rebuilt_bytes)).hexdigest().lower()
+            if actual_sha != exp_sha:
+                raise RuntimeError(
+                    'rebuilt fault snapshot sha256 {} does not match report fault_snapshot {}'.format(
+                        actual_sha, exp_sha
+                    )
+                )
+        if 'uncorrectable_words' in fault_snap and fault_snap['uncorrectable_words'] is not None:
+            exp_marks = set(
+                int(str(item), 0)
+                for item in (fault_snap.get('uncorrectable_words') or ())
+            )
+            if rebuilt_mark_addrs != exp_marks:
+                raise RuntimeError(
+                    'rebuilt uncorrectable words {} do not match report fault_snapshot {}'.format(
+                        [fmt_u32(a) for a in sorted(rebuilt_mark_addrs)],
+                        [fmt_u32(a) for a in sorted(exp_marks)],
+                    )
+                )
+        closest = fault_snap.get('closest_declared_image')
+        if isinstance(closest, dict) and closest.get('ranges_truncated') is False:
+            for span in closest.get('differing_ranges') or ():
+                if not isinstance(span, dict) or span.get('bytes_truncated'):
+                    continue
+                addr = int(str(span['address']), 0)
+                exp_hex = str(span.get('actual_hex') or '').strip().lower()
+                if not exp_hex:
+                    continue
+                span_len = len(exp_hex) // 2
+                rel = addr - base_addr
+                if 0 <= rel and rel + span_len <= len(rebuilt_bytes):
+                    obs_hex = binascii.hexlify(
+                        bytes(rebuilt_bytes[rel:rel + span_len])
+                    ).decode('ascii').lower()
+                    if obs_hex != exp_hex:
+                        raise RuntimeError(
+                            'rebuilt bytes at {} ({}) do not match fault_snapshot differing_ranges ({})'.format(
+                                fmt_u32(addr), obs_hex, exp_hex
+                            )
+                        )
+
+    comparison = explanation.get('state_comparison')
+    if isinstance(comparison, dict):
+        for span in comparison.get('ranges') or ():
+            if not isinstance(span, dict) or not span.get('address'):
+                continue
+            exp_hex = str(span.get('failing_hex') or '').strip().lower()
+            if not exp_hex:
+                continue
+            addr = int(str(span['address']), 0)
+            span_len = len(exp_hex) // 2
+            rel = addr - base_addr
+            if 0 <= rel and rel + span_len <= len(rebuilt_bytes):
+                obs_hex = binascii.hexlify(
+                    bytes(rebuilt_bytes[rel:rel + span_len])
+                ).decode('ascii').lower()
+                if obs_hex != exp_hex:
+                    raise RuntimeError(
+                        'rebuilt bytes at {} ({}) do not match failure_explanation state_comparison ({})'.format(
+                            fmt_u32(addr), obs_hex, exp_hex
+                        )
+                    )
+        for item in comparison.get('uncorrectable_only_in_failing') or ():
+            addr = int(str(item), 0)
+            if addr not in rebuilt_mark_addrs:
+                raise RuntimeError(
+                    'rebuilt state is missing uncorrectable ECC mark at {} required by failure_explanation'.format(
+                        fmt_u32(addr)
+                    )
+                )
+        for item in comparison.get('uncorrectable_only_in_passing') or ():
+            addr = int(str(item), 0)
+            if addr in rebuilt_mark_addrs:
+                raise RuntimeError(
+                    'rebuilt state unexpectedly has uncorrectable ECC mark at {} prohibited by failure_explanation'.format(
+                        fmt_u32(addr)
+                    )
+                )
+        for pv in comparison.get('persistent_values') or ():
+            if not isinstance(pv, dict):
+                continue
+            pv_name = str(pv.get('name') or '').strip()
+            exp_pv_hex = str(pv.get('failing_hex') or '').strip().lower()
+            if pv_name and exp_pv_hex:
+                obs_pv = rebuilt_pv_map.get(pv_name)
+                obs_pv_hex = (
+                    binascii.hexlify(bytes(bytearray(obs_pv))).decode('ascii').lower()
+                    if obs_pv is not None
+                    else ''
+                )
+                if obs_pv_hex != exp_pv_hex:
+                    raise RuntimeError(
+                        'rebuilt persistent value {!r} ({}) does not match failure_explanation ({})'.format(
+                            pv_name, obs_pv_hex, exp_pv_hex
+                        )
+                    )
+    return actual_state_id
+
+
+def _debug_apply_snapshot_in_place(snapshot):
+    if snapshot is None:
+        return
+    flash_data = snapshot.get('flash')
+    if flash_data is not None:
+        if backend['kind'] == 'mram':
+            restore_raw = getattr(backend['data'], 'RestoreSnapshotRaw', None)
+            if restore_raw is not None:
+                restore_raw(flash_data)
+            else:
+                backend['data'].WriteBytes(0, flash_data, 0, len(flash_data))
+        elif backend['kind'] == 'slow':
+            restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
+            if restore_raw is not None:
+                restore_raw(flash_data)
+            else:
+                backend['data'].Nvm.WriteBytes(0, flash_data, 0, len(flash_data))
+        elif backend['kind'] == 'otp':
+            test_restore = getattr(backend['data'], 'TestRestore', None)
+            if test_restore is not None:
+                test_restore(flash_data)
+            else:
+                backend['data'].WriteBytes(0, flash_data, 0, len(flash_data))
+        else:
+            backend['data'].Flash.WriteBytes(0, flash_data)
+    otp = backend.get('otp')
+    if otp is not None and 'otp' in snapshot.get('persistent_values', {}):
+        otp.TestRestore(snapshot['persistent_values']['otp'])
+    _clear_mram_uncorrectable_words()
+    if snapshot.get('uncorrectable_offsets'):
+        _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
+
+
+def _debug_prepare_recovery_boot(snapshot):
+    if backend['kind'] == 'slow':
+        _capture_recovery_marker_precondition()
+        _machine_reset(apply_tracking_gate=False)
+        monitor.Parse('machine Pause')
+        _clear_volatile_memory()
+        _verify_recovery_marker_cleared()
+        _bus_load_elf(bootloader_elf)
+        if image_exec_path:
+            _bus_load_binary(
+                image_exec_path,
+                slot_load_addresses.get('exec', slot_exec_base),
+            )
+        if image_staging_path:
+            _bus_load_binary(
+                image_staging_path,
+                slot_load_addresses.get('staging', slot_staging_base),
+            )
+        if snapshot.get('flash') is not None:
+            restore_raw = getattr(backend['data'].Nvm, 'RestoreSnapshotRaw', None)
+            if restore_raw is not None:
+                restore_raw(snapshot['flash'])
+            else:
+                backend['data'].Nvm.WriteBytes(
+                    0, snapshot['flash'], 0, len(snapshot['flash'])
+                )
+        otp = backend.get('otp')
+        if otp is not None and 'otp' in snapshot.get('persistent_values', {}):
+            otp.TestRestore(snapshot['persistent_values']['otp'])
+        _clear_mram_uncorrectable_words()
+        if snapshot.get('uncorrectable_offsets'):
+            _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
+        prime_bootloader_entry()
+    else:
+        _phase2_chain_restore(snapshot)
+    if _hash_bypass_active:
+        apply_hash_bypass()
+    reset_nvmc_for_recovery(
+        tracking_start=_recovery_tracking_start(
+            inherit_first_gate=bool(debug_state_search_gated)
+        )
+    )
+    if snapshot.get('uncorrectable_offsets'):
+        _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
+    _clear_mram_uncorrectable_read_log()
+    disarm_fault()
+
+
+def _debug_prepare_and_arm_cut(cut_index, cut_at, cut_code, previous_snapshot):
+    code = str(cut_code or 'w').strip()
+    arm_meta = {'code': code, 'cut_at': int(cut_at), 'pre_boot': False}
+    if code.startswith('m:'):
+        m_type = code.split(':')[1] if ':' in code else 'w'
+        _machine_reset()
+        monitor.Parse('machine Pause')
+        reload_images()
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        applied, fault_addr, injected = apply_partial_pre_boot_state(
+            cut_at, fault_type=m_type
+        )
+        if not injected:
+            raise RuntimeError(
+                'metadata fault at index {} was not injected'.format(cut_at)
+            )
+        prime_bootloader_entry()
+        restore_hw_init()
+        reset_nvmc_for_sweep()
+        disarm_fault()
+        arm_meta['pre_boot'] = True
+        arm_meta['fault_address'] = fault_addr
+        return arm_meta
+
+    if code.startswith('nv:'):
+        variant_idx = int(code.split(':')[1])
+        if (
+            nvs_region_addr is None
+            or not nvs_region_size
+            or variant_idx >= len(nvs_corruption_variants)
+        ):
+            raise RuntimeError(
+                'NVS corruption variant {} is out of range or not configured'.format(
+                    variant_idx
+                )
+            )
+        variant = nvs_corruption_variants[variant_idx]
+        clean_data = _load_nvs_clean_data()
+        corrupted = _generate_nvs_corruption(
+            clean_data,
+            variant,
+            seed=nvs_corruption_seed + variant_idx,
+        )
+        _machine_reset()
+        monitor.Parse('machine Pause')
+        reload_images()
+        apply_pre_boot_state()
+        if _hash_bypass_active:
+            apply_hash_bypass()
+        bus.WriteBytes(to_clr_bytes(corrupted), nvs_region_addr)
+        prime_bootloader_entry()
+        restore_hw_init()
+        reset_nvmc_for_sweep()
+        disarm_fault()
+        arm_meta['pre_boot'] = True
+        arm_meta['fault_address'] = int(nvs_region_addr)
+        return arm_meta
+
+    if cut_index == 0:
+        restore_phase1_baseline()
+        carried_offsets = []
+    else:
+        _phase2_chain_restore(previous_snapshot)
+        carried_offsets = list(
+            previous_snapshot.get('uncorrectable_offsets', ())
+        )
+        if _hash_bypass_active:
+            apply_hash_bypass()
+
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    tracking_start = (
+        tracking_start_address_config
+        if cut_index == 0
+        else _recovery_tracking_start(
+            inherit_first_gate=bool(debug_state_search_gated)
+        )
+    )
+    reset_nvmc_for_sweep(tracking_start=tracking_start)
+    if carried_offsets:
+        _restore_mram_uncorrectable_offsets(carried_offsets)
+    _clear_mram_uncorrectable_read_log()
+
+    _select_point_mram_torn_word(cut_at)
+    select_flash_tw = globals().get('_select_point_torn_word')
+    if callable(select_flash_tw):
+        select_flash_tw(cut_at)
+
+    if code.startswith('i:'):
+        parts = code.split(':')
+        skip_addr = int(parts[1], 0)
+        patch_model = parts[2] if len(parts) > 2 else 'nop'
+        patch_info = _resolve_instruction_skip_patch(skip_addr, patch_model)
+        if not patch_info.get('supported'):
+            raise RuntimeError(
+                'instruction patch unsupported at 0x{:08X}: {}'.format(
+                    skip_addr, patch_info.get('skip_reason')
+                )
+            )
+        for idx_hw, hw in enumerate(patch_info['patched_halfwords']):
+            bus.WriteWord((skip_addr & ~1) + (idx_hw * 2), int(hw) & 0xFFFF)
+        disarm_fault()
+        arm_meta['skip_address'] = skip_addr & ~1
+        arm_meta['fault_address'] = skip_addr & ~1
+        return arm_meta
+
+    if code.startswith('tb:'):
+        parts = code.split(':')
+        trigger_addr = int(parts[1], 0)
+        corrupt_addr = int(parts[2], 0) if len(parts) > 2 else 0
+        bit_flips = int(parts[3]) if len(parts) > 3 else 1
+        rf_obj = _tb_get_read_fault_obj()
+        if rf_obj is None:
+            raise RuntimeError('timed_bit_corruption unsupported on backend')
+        target_addr = corrupt_addr if corrupt_addr != 0 else (
+            pick_target_address_in_regions(
+                read_fault_regions, cut_at, write_granularity
+            )[0]
+        )
+        backend_size_rt = backend.get('bus_size') or int(rf_obj.Size)
+        nvm_off, addr_skip = translate_bus_address_to_backend_offset(
+            target_addr, backend.get('bus_base'), backend_size_rt
+        )
+        if addr_skip is not None:
+            raise RuntimeError(
+                'timed_bit_corruption target invalid: {}'.format(addr_skip)
+            )
+        _tb_active['enabled'] = True
+        _tb_active['armed'] = False
+        _tb_active['nvm_offset'] = nvm_off
+        _tb_active['seed'] = (
+            (read_fault_seed or 0xBEEF) ^ (int(cut_at) * 2654435761)
+        ) & 0xFFFFFFFF
+        _tb_active['bit_flips'] = bit_flips
+        _tb_install_hook_if_needed(cpu_ref, trigger_addr)
+        disarm_fault()
+        arm_meta['fault_address'] = target_addr
+        return arm_meta
+
+    if code == 't':
+        disarm_fault()
+        duration_s = parse_duration_seconds(default=2.0)
+        max_fp = max(fault_points) if fault_points else max(1, cut_at)
+        frac = (
+            0.0
+            if max_fp <= 0
+            else min(1.0, max(0.0, float(cut_at) / float(max_fp)))
+        )
+        arm_meta['trigger_s'] = max(
+            0.005, min(duration_s * 0.95, frac * duration_s)
+        )
+        return arm_meta
+
+    if code == 'f':
+        disarm_fault()
+        armed = _arm_read_bit_flip(cut_at)
+        if armed.get('skip_reason'):
+            raise RuntimeError(
+                'read_bit_flip at {} was skipped: {}'.format(
+                    cut_at, armed['skip_reason']
+                )
+            )
+        arm_meta['fault_address'] = armed.get('read_fault_address', 0)
+        return arm_meta
+
+    if code == 'k':
+        preflight = ensure_command_fault_preflight()
+        if not preflight.get('supported'):
+            raise RuntimeError(
+                'command_drop unsupported: {}'.format(preflight.get('reason'))
+            )
+        base_cmds = get_total_commands()
+        arm_at = base_cmds + cut_at + 1
+        if arm_at > base_cmds + max_writes_cap:
+            arm_at = base_cmds + max_writes_cap + 1
+        arm_controller_fault(arm_at, command_fault_mode=1)
+        disarm_write_fault()
+        disarm_erase_fault()
+        return arm_meta
+
+    if code in _I2C_WIRE_CODE_TO_FAULT_TYPE:
+        preflight = ensure_i2c_fault_preflight()
+        if not preflight.get('supported'):
+            raise RuntimeError(
+                'I2C fault unsupported: {}'.format(preflight.get('reason'))
+            )
+        i2c_ft = _I2C_WIRE_CODE_TO_FAULT_TYPE[code]
+        base_txns = get_total_i2c_transactions()
+        arm_at = base_txns + cut_at + 1
+        if arm_at > base_txns + max_writes_cap:
+            arm_at = base_txns + max_writes_cap + 1
+        arm_i2c_fault(arm_at, i2c_fault_type=i2c_ft)
+        disarm_write_fault()
+        disarm_erase_fault()
+        return arm_meta
+
+    if code in _OTP_WIRE_CODES and backend.get('otp') is not None:
+        fault_base = _base_fault_type_code(code)
+        blow_mode = _WRITE_FAULT_MODE.get(fault_base, 0)
+        base_blows = get_total_otp_blows()
+        arm_at = base_blows + cut_at + 1
+        if arm_at > base_blows + max_writes_cap:
+            arm_at = base_blows + max_writes_cap + 1
+        arm_otp_fault(arm_at, blow_fault_mode=blow_mode)
+        disarm_write_fault()
+        disarm_erase_fault()
+        return arm_meta
+
+    if code in ('e', 'a'):
+        erase_mode = 1 if code == 'a' else 0
+        base_erases = get_total_erases()
+        arm_erase_fault(base_erases + cut_at + 1, erase_fault_mode=erase_mode)
+        disarm_write_fault()
+        return arm_meta
+
+    if code.startswith('b:') and code[2:].isdigit():
+        cseed = int(code[2:])
+        if backend['kind'] == 'fast':
+            backend['data'].CorruptionSeed = cseed
+        elif backend['kind'] != 'mram':
+            backend['data'].Nvm.CorruptionSeed = cseed
+
+    if _fault_uses_rc_injection_return_hook(code):
+        preflight = ensure_rc_injection_preflight()
+        if not preflight.get('supported'):
+            raise RuntimeError(
+                'rc_injection preflight failed: {}'.format(
+                    preflight.get('reason') or 'symbol_resolution_failed'
+                )
+            )
+    reset_rc_injection_state(
+        enabled=_fault_uses_rc_injection_return_hook(code)
+    )
+    fault_base = _base_fault_type_code(code)
+    write_mode = _WRITE_FAULT_MODE.get(fault_base, 0)
+    base_writes = get_total_writes()
+    arm_at = base_writes + cut_at + 1
+    if cut_index == 0 and arm_at > base_writes + max_writes_cap:
+        arm_at = base_writes + max_writes_cap + 1
+    arm_fault(arm_at, write_fault_mode=write_mode)
+    disarm_erase_fault()
+    return arm_meta
+
+
+def _debug_has_cut_fired(cut_code, arm_meta, cpu_ref):
+    code = str(cut_code or 'w').strip()
+    if arm_meta.get('pre_boot'):
+        return True
+    if code.startswith('i:'):
+        pc_now = as_int(cpu_ref.GetRegisterUnsafe(15)) & ~1
+        return pc_now == int(arm_meta.get('skip_address', -1))
+    if code == 'f' or code.startswith('tb:'):
+        rf_obj = _tb_get_read_fault_obj()
+        return bool(rf_obj is not None and getattr(rf_obj, 'ReadFaultFired', False))
+    if code in _I2C_WIRE_CODE_TO_FAULT_TYPE:
+        return bool(was_i2c_fault_injected())
+    if code in _OTP_WIRE_CODES and backend.get('otp') is not None:
+        return bool(was_otp_fault_injected())
+    return bool(was_fault_injected())
+
+
+def _debug_run_cut_segment(
+    cut_index, cut_at, cut_code, previous_snapshot, stop_at_this_cut=False
+):
+    global trace_data_loaded, erase_trace_loaded
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    arm_meta = _debug_prepare_and_arm_cut(
+        cut_index, cut_at, cut_code, previous_snapshot
+    )
+    code = str(cut_code or 'w').strip()
+    if arm_meta.get('pre_boot'):
+        return _phase2_chain_snapshot(), arm_meta
+
+    if code == 't':
+        trigger_s = float(arm_meta['trigger_s'])
+        err = _run_for_with_watchdog(
+            cpu_ref,
+            '{:.3f}'.format(trigger_s),
+            runfor_watchdog_timeout_s,
+            label='debug_cut_{}_timed'.format(cut_index + 1),
+        )
+        if err is not None:
+            raise RuntimeError(
+                'timed reset cut failed: {}'.format(err.get('message'))
+            )
+        return _phase2_chain_snapshot(), arm_meta
+
+    wb_trace_ctx = None
+    if (
+        writeback_active()
+        and cut_index == 0
+        and _debug_cut_is_reset_boundary(code)
+    ):
+        try:
+            wb_trace_ctx = _enable_replay_cross_check_live_trace()
+        except Exception:
+            wb_trace_ctx = None
+
+    if not stop_at_this_cut and _debug_cut_is_reset_boundary(code):
+        status = run_until_done(
+            cpu_ref,
+            label='debug_cut_{}_{}_{}'.format(cut_index + 1, cut_at, code),
+            stop_on_fault=True,
+            max_iters=(
+                phase1_max_iters(default_s=4.0) if cut_index == 0 else 200
+            ),
+            wall_timeout=(
+                phase1_wall_timeout(default_s=4.0) if cut_index == 0 else 60
+            ),
+            time_slice=(None if cut_index == 0 else phase2_time_slice),
+        )
+        wb_live_trace = None
+        if wb_trace_ctx is not None:
+            wb_live_trace = _finish_replay_cross_check_live_trace(wb_trace_ctx)
+        injected = _debug_has_cut_fired(code, arm_meta, cpu_ref)
+        disarm_fault()
+        if code in _OTP_WIRE_CODES and backend.get('otp') is not None:
+            disarm_otp_fault()
+        if isinstance(status, dict) and status.get('infrastructure_error'):
+            raise RuntimeError(
+                status.get('error', 'RunFor infrastructure error during cut replay')
+            )
+        if not injected:
+            raise RuntimeError(
+                'cut {} ({}[{}]) was not injected during replay'.format(
+                    cut_index + 1, code, cut_at
+                )
+            )
+        snapshot = _phase2_chain_snapshot()
+        if wb_live_trace is not None and snapshot.get('flash') is not None:
+            wb_base, _ = flash_geometry()
+            wb_ps = effective_page_size()
+            wb_init = (
+                _cached_update_sequence_fault_flash
+                if update_sequence_enabled
+                else _cached_initial_flash
+            )
+            if wb_init is not None:
+                wb_init = to_py_bytes(wb_init)
+            wb_erases = [
+                (
+                    int(item['flash_offset']),
+                    int(item['writes_at_this_point']),
+                    int(item['erase_size']),
+                )
+                for item in wb_live_trace.get('erases', ())
+            ]
+            trace_data_loaded = list(wb_live_trace.get('writes', ()))
+            erase_trace_loaded = list(wb_erases)
+            stripped_bytes, _ = writeback_strip_uncommitted_from_snapshot(
+                to_py_bytes(snapshot['flash']),
+                trace_data_loaded,
+                wb_erases,
+                cut_at,
+                wb_base,
+                wb_ps,
+                initial_snapshot=wb_init,
+            )
+            snapshot['flash'] = to_clr_bytes(stripped_bytes)
+        arm_meta['fault_address'] = (
+            get_last_command_address()
+            if code == 'k'
+            else get_last_write_address()
+        )
+        return snapshot, arm_meta
+
+    # Two-pass exact-instruction stop for --stop-at cut
+    slice_str = '0.002'
+    max_slices = max(500, int(parse_duration_seconds(default=4.0) / 0.002) + 50)
+    fired_slice = None
+    try:
+        for s_idx in range(1, max_slices + 1):
+            err = _run_for_with_watchdog(
+                cpu_ref,
+                slice_str,
+                runfor_watchdog_timeout_s,
+                label='debug_cut_p1_{}'.format(s_idx),
+            )
+            if err is not None:
+                raise RuntimeError(
+                    'RunFor error during cut search: {}'.format(err.get('message'))
+                )
+            if _debug_has_cut_fired(code, arm_meta, cpu_ref):
+                fired_slice = s_idx
+                break
+    finally:
+        wb_live_trace = None
+        if wb_trace_ctx is not None:
+            wb_live_trace = _finish_replay_cross_check_live_trace(wb_trace_ctx)
+
+    if fired_slice is None:
+        disarm_fault()
+        raise RuntimeError(
+            'cut {} ({}[{}]) was not reached during replay'.format(
+                cut_index + 1, code, cut_at
+            )
+        )
+    disarm_fault()
+    if code in _OTP_WIRE_CODES and backend.get('otp') is not None:
+        disarm_otp_fault()
+    snapshot = _phase2_chain_snapshot()
+    if wb_live_trace is not None and snapshot.get('flash') is not None:
+        wb_base, _ = flash_geometry()
+        wb_ps = effective_page_size()
+        wb_init = (
+            _cached_update_sequence_fault_flash
+            if update_sequence_enabled
+            else _cached_initial_flash
+        )
+        if wb_init is not None:
+            wb_init = to_py_bytes(wb_init)
+        wb_erases = [
+            (
+                int(item['flash_offset']),
+                int(item['writes_at_this_point']),
+                int(item['erase_size']),
+            )
+            for item in wb_live_trace.get('erases', ())
+        ]
+        trace_data_loaded = list(wb_live_trace.get('writes', ()))
+        erase_trace_loaded = list(wb_erases)
+        stripped_bytes, _ = writeback_strip_uncommitted_from_snapshot(
+            to_py_bytes(snapshot['flash']),
+            trace_data_loaded,
+            wb_erases,
+            cut_at,
+            wb_base,
+            wb_ps,
+            initial_snapshot=wb_init,
+        )
+        snapshot['flash'] = to_clr_bytes(stripped_bytes)
+    arm_meta['fault_address'] = (
+        arm_meta.get('fault_address')
+        or (
+            get_last_command_address()
+            if code == 'k'
+            else get_last_write_address()
+        )
+    )
+
+    # Pass 2: replay (fired_slice - 1) slices at full speed, then step with block hook
+    arm_meta = _debug_prepare_and_arm_cut(
+        cut_index, cut_at, cut_code, previous_snapshot
+    )
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    for s_idx in range(1, fired_slice):
+        err = _run_for_with_watchdog(
+            cpu_ref,
+            slice_str,
+            runfor_watchdog_timeout_s,
+            label='debug_cut_p2_fast_{}'.format(s_idx),
+        )
+        if err is not None:
+            raise RuntimeError(
+                'RunFor error during cut replay: {}'.format(err.get('message'))
+            )
+
+    hook_state = {'fired': False, 'pc': 0}
+
+    def _on_cut_block(_cpu, pc):
+        if hook_state['fired']:
+            return
+        if _debug_has_cut_fired(code, arm_meta, cpu_ref):
+            hook_state['fired'] = True
+            hook_state['pc'] = as_int(pc)
+            disarm_fault()
+            try:
+                _cpu.IsHalted = True
+            except Exception:
+                cpu_ref.IsHalted = True
+
+    saved_block_size = 0
+    try:
+        saved_block_size = int(cpu_ref.MaximumBlockSize)
+    except Exception:
+        saved_block_size = 0
+    try:
+        cpu_ref.MaximumBlockSize = 1
+    except Exception:
+        pass
+    cpu_ref.SetHookAtBlockBegin(_on_cut_block)
+    try:
+        for _ in range(4):
+            if hook_state['fired'] or _debug_has_cut_fired(code, arm_meta, cpu_ref):
+                hook_state['fired'] = True
+                break
+            _run_for_with_watchdog(
+                cpu_ref,
+                slice_str,
+                runfor_watchdog_timeout_s,
+                label='debug_cut_p2_exact',
+            )
+    finally:
+        try:
+            cpu_ref.ClearHookAtBlockBegin()
+        except Exception:
+            pass
+        if saved_block_size > 0:
+            try:
+                cpu_ref.MaximumBlockSize = saved_block_size
+            except Exception:
+                pass
+        disarm_fault()
+        if code in _OTP_WIRE_CODES and backend.get('otp') is not None:
+            disarm_otp_fault()
+
+    monitor.Parse('machine Pause')
+    if _debug_cut_is_reset_boundary(code):
+        _debug_apply_snapshot_in_place(snapshot)
+    return snapshot, arm_meta
+
+
+def _debug_collect_fault_handler_addresses():
+    addrs = set()
+    candidate_bases = [0, int(bootloader_entry)]
+    for _sn, (s_lo, _s_hi) in slot_ranges.items():
+        candidate_bases.append(int(s_lo) + int(success_vector_offset))
+    for base_addr in candidate_bases:
+        for exc_num in (3, 4, 5, 6, 7):
+            try:
+                vec = as_int(bus.ReadDoubleWord(base_addr + (exc_num * 4))) & 0xFFFFFFFF
+                if (vec & 1) == 1 and 0 < (vec & ~1) < 0xE0000000:
+                    addrs.add(vec & ~1)
+            except Exception:
+                pass
+    return addrs
+
+
+def _debug_is_terminal_halt_pc(cpu_ref, pc_value):
+    pc_addr = int(pc_value) & ~1
+    try:
+        insn = as_int(bus.ReadWord(pc_addr)) & 0xFFFF
+    except Exception:
+        return False
+    if insn in (0xE7FE, 0xBF30, 0xBE00):
+        return True
+    if insn == 0xE7FD and pc_addr >= 2:
+        try:
+            prev_insn = as_int(bus.ReadWord(pc_addr - 2)) & 0xFFFF
+            if prev_insn == 0xBF30:
+                return True
+        except Exception:
+            pass
+    term_fn = globals().get('_provable_terminal_self_branch')
+    if callable(term_fn) and term_fn(cpu_ref, pc_value) is not None:
+        return True
+    return False
+
+
+def _debug_check_first_fault_now(
+    cpu_ref,
+    fault_handler_addrs,
+    has_fsr,
+    single_boot_code=None,
+    single_boot_meta=None,
+    prev_pc=None,
+):
+    pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+    pc_norm = pc_now & ~1
+    try:
+        xpsr = as_int(getattr(cpu_ref, 'XProgramStatusRegister', 0)) & 0xFFFFFFFF
+        ipsr = xpsr & 0x1FF
+    except Exception:
+        ipsr = 0
+    if ipsr in (3, 4, 5, 6, 7):
+        return 'cpu_exception({})'.format(ipsr)
+    if pc_norm in fault_handler_addrs:
+        return 'fault_handler(0x{:08X})'.format(pc_norm)
+    try:
+        if bool(getattr(cpu_ref, 'IsLockedUp', False)) or pc_norm == 0xEFFFFFFE:
+            return 'cpu_lockup'
+    except Exception:
+        pass
+    if has_fsr:
+        try:
+            cfsr = as_int(bus.ReadDoubleWord(0xE000ED28))
+            if cfsr != 0:
+                return 'cfsr(0x{:08X})'.format(cfsr)
+        except Exception:
+            pass
+    mram_target_fn = globals().get('_mram_uncorrectable_target')
+    if callable(mram_target_fn):
+        try:
+            m_target = mram_target_fn()
+            if m_target is not None and int(getattr(m_target, 'UncorrectableReadCount', 0) or 0) > 0:
+                return 'uncorrectable_mram_read'
+        except Exception:
+            pass
+    if single_boot_code is not None and single_boot_meta is not None:
+        if not single_boot_meta.get('pre_boot'):
+            if _debug_has_cut_fired(single_boot_code, single_boot_meta, cpu_ref):
+                return 'peripheral_fault({})'.format(single_boot_code)
+    if check_console_fatal():
+        return 'console_fatal'
+    if prev_pc is not None and prev_pc == pc_norm and not sticky_vtor['captured'] and not sticky_pc['captured']:
+        if _debug_is_terminal_halt_pc(cpu_ref, pc_now):
+            return 'terminal_fault_loop(0x{:08X})'.format(pc_norm)
+    return None
+
+
+def _debug_run_to_first_fault(
+    prepare_boot_fn, single_boot_code=None, single_boot_meta_box=None
+):
+    prepare_boot_fn()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    fault_handler_addrs = _debug_collect_fault_handler_addresses()
+    fsr_fn = globals().get('_cpu_supports_fault_status_registers')
+    if callable(fsr_fn):
+        has_fsr = bool(fsr_fn(cpu_ref))
+    else:
+        raw_model = str(getattr(cpu_ref, 'Model', '') or '').strip().lower().replace('_', '-')
+        has_fsr = raw_model not in (
+            'cortex-m0', 'cortex-m0+', 'cortex-m0plus', 'cortex-m1', 'armv6-m', 'armv6m'
+        )
+
+    arm_vtor_watchpoint()
+    slice_str = '0.002'
+    max_slices = max(500, int(parse_duration_seconds(default=4.0) / 0.002) + 50)
+    fired_slice = None
+    fired_reason = None
+    prev_pc = None
+    try:
+        for s_idx in range(1, max_slices + 1):
+            err = _run_for_with_watchdog(
+                cpu_ref,
+                slice_str,
+                runfor_watchdog_timeout_s,
+                label='debug_ff_p1_{}'.format(s_idx),
+            )
+            if err is not None:
+                raise RuntimeError(
+                    'RunFor error during first-fault search: {}'.format(err.get('message'))
+                )
+            pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+            vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+            if vtor_now != 0:
+                for sn, (s_lo, s_hi) in slot_ranges.items():
+                    if s_lo <= vtor_now < s_hi:
+                        sticky_vtor['value'] = vtor_now
+                        sticky_vtor['slot'] = sn
+                        sticky_vtor['captured'] = True
+                        break
+            capture_sticky_pc(pc_now)
+            sb_meta = single_boot_meta_box[0] if single_boot_meta_box else None
+            reason = _debug_check_first_fault_now(
+                cpu_ref,
+                fault_handler_addrs,
+                has_fsr,
+                single_boot_code=single_boot_code,
+                single_boot_meta=sb_meta,
+                prev_pc=prev_pc,
+            )
+            prev_pc = pc_now & ~1
+            if reason is not None:
+                fired_slice = s_idx
+                fired_reason = reason
+                break
+            if sticky_vtor['captured'] or (
+                success_pc_slot in slot_ranges
+                and sticky_pc['captured']
+                and sticky_pc.get('slot') == success_pc_slot
+            ):
+                break
+    finally:
+        disarm_vtor_watchpoint()
+
+    if fired_slice is None:
+        vtor_val = as_int(bus.ReadDoubleWord(0xE000ED08))
+        pc_val = as_int(cpu_ref.GetRegisterUnsafe(15))
+        outcome, _slot, _sig = evaluate_boot_outcome(
+            vtor_val, pc_val, fault_injected=True
+        )
+        raise RuntimeError(
+            'no fault occurred during boot for --stop-at first-fault '
+            '(boot completed with outcome {!r}; use --stop-at recovery-reset or --stop-at cut)'.format(
+                outcome
+            )
+        )
+
+    # Pass 2: replay (fired_slice - 1) slices at full speed, then pause on exact fault block
+    prepare_boot_fn()
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    arm_vtor_watchpoint()
+    for s_idx in range(1, fired_slice):
+        err = _run_for_with_watchdog(
+            cpu_ref,
+            slice_str,
+            runfor_watchdog_timeout_s,
+            label='debug_ff_p2_fast_{}'.format(s_idx),
+        )
+        if err is not None:
+            disarm_vtor_watchpoint()
+            raise RuntimeError(
+                'RunFor error during first-fault replay: {}'.format(err.get('message'))
+            )
+
+    hook_state = {'fired': False, 'reason': fired_reason, 'prev_pc': None}
+    sb_meta = single_boot_meta_box[0] if single_boot_meta_box else None
+
+    def _on_ff_block(_cpu, pc):
+        if hook_state['fired']:
+            return
+        reason_now = _debug_check_first_fault_now(
+            cpu_ref,
+            fault_handler_addrs,
+            has_fsr,
+            single_boot_code=single_boot_code,
+            single_boot_meta=sb_meta,
+            prev_pc=hook_state['prev_pc'],
+        )
+        hook_state['prev_pc'] = as_int(pc) & ~1
+        if reason_now is not None:
+            hook_state['fired'] = True
+            hook_state['reason'] = reason_now
+            try:
+                _cpu.IsHalted = True
+            except Exception:
+                cpu_ref.IsHalted = True
+
+    saved_block_size = 0
+    try:
+        saved_block_size = int(cpu_ref.MaximumBlockSize)
+    except Exception:
+        saved_block_size = 0
+    try:
+        cpu_ref.MaximumBlockSize = 1
+    except Exception:
+        pass
+    cpu_ref.SetHookAtBlockBegin(_on_ff_block)
+    try:
+        for _ in range(4):
+            if hook_state['fired']:
+                break
+            _run_for_with_watchdog(
+                cpu_ref,
+                slice_str,
+                runfor_watchdog_timeout_s,
+                label='debug_ff_p2_exact',
+            )
+    finally:
+        try:
+            cpu_ref.ClearHookAtBlockBegin()
+        except Exception:
+            pass
+        if saved_block_size > 0:
+            try:
+                cpu_ref.MaximumBlockSize = saved_block_size
+            except Exception:
+                pass
+    monitor.Parse('machine Pause')
+    return hook_state['reason']
+
+
+def _debug_restore_continuous_execution(cpu_ref):
+    try:
+        cpu_ref.ShouldEnterDebugMode = False
+    except Exception as exc:
+        log('debug: ShouldEnterDebugMode reset skipped: {}'.format(exc))
+    try:
+        cpu_ref.IsSingleStepBlocking = False
+    except Exception:
+        pass
+    try:
+        import clr as _clr
+        import System as _Sys
+        em_type = _clr.GetClrType(type(cpu_ref.ExecutionMode))
+        try:
+            cpu_ref.ExecutionMode = _Sys.Enum.Parse(em_type, 'Continuous')
+        except Exception:
+            cpu_ref.ExecutionMode = _Sys.Enum.ToObject(em_type, 0)
+    except Exception as exc:
+        log('debug: ExecutionMode Continuous restore skipped: {}'.format(exc))
+
+
+def _debug_pause_for_gdb(m_ref, cpu_ref):
+    try:
+        import clr as _clr
+        import System as _Sys
+        em_type = _clr.GetClrType(type(cpu_ref.ExecutionMode))
+        try:
+            cpu_ref.ExecutionMode = _Sys.Enum.Parse(em_type, 'SingleStep')
+        except Exception:
+            cpu_ref.ExecutionMode = _Sys.Enum.ToObject(em_type, 1)
+    except Exception:
+        pass
+    try:
+        m_ref.Pause()
+    except Exception:
+        monitor.Parse('machine Pause')
+    try:
+        import clr as _clr
+        import System.Reflection as _R
+        from System import Array as _Array, Object as _Object
+        cpu_type = _clr.GetClrType(type(cpu_ref))
+        inv_m = cpu_type.GetMethod(
+            'InvokeHalted',
+            _R.BindingFlags.Public | _R.BindingFlags.NonPublic | _R.BindingFlags.Instance,
+        )
+        if inv_m is not None:
+            p_info = inv_m.GetParameters()
+            if len(p_info) == 1:
+                halt_args_type = p_info[0].ParameterType
+                ctor_params = halt_args_type.GetConstructors()[0].GetParameters()
+                reason_enum_type = ctor_params[0].ParameterType
+                pause_reason = getattr(reason_enum_type, 'Pause', None)
+                if pause_reason is None:
+                    import System as _Sys
+                    pause_reason = _Sys.Enum.Parse(reason_enum_type, 'Pause')
+                h_args = halt_args_type.GetConstructors()[0].Invoke(
+                    _Array[_Object]([pause_reason, cpu_ref, None, None])
+                )
+                inv_m.Invoke(cpu_ref, _Array[_Object]([h_args]))
+    except Exception as exc:
+        log('debug: InvokeHalted notification skipped: {}'.format(exc))
+
+
+def _debug_read_machine_virtual_s(m_ref):
+    if m_ref is None:
+        return 0.0
+    try:
+        evt = getattr(m_ref, 'ElapsedVirtualTime', None)
+        if evt is None:
+            return 0.0
+        time_elapsed = getattr(evt, 'TimeElapsed', evt)
+        total_us = getattr(time_elapsed, 'TotalMicroseconds', None)
+        if total_us is not None:
+            return float(total_us) / 1000000.0
+        total_s = getattr(time_elapsed, 'TotalSeconds', None)
+        if total_s is not None:
+            return float(total_s)
+        to_timespan = getattr(time_elapsed, 'ToTimeSpan', None)
+        if callable(to_timespan):
+            return float(to_timespan().TotalSeconds)
+    except Exception:
+        pass
+    return 0.0
+
+
+def run_debug_session(fault_at, fault_type='w'):
+    started = _time.time()
+    ft = str(fault_type or 'w').strip()
+    is_control = int(fault_at) < 0 or ft == 'control'
+    cuts = _debug_parse_cuts(fault_at, ft)
+    if is_control:
+        eff_criteria = None
+    elif ft.startswith(('p2:', 'pc:')):
+        eff_criteria = get_effective_criteria('p2')
+    elif ft.startswith('mf:') and cuts:
+        eff_criteria = get_effective_criteria(cuts[-1][1])
+    else:
+        eff_criteria = get_effective_criteria(ft)
+
+    reset_verification_probes()
+    expected_payload, preloaded_state = _debug_load_expected_state_payload()
+    previous_snapshot = None
+    last_arm_meta = {}
+    actual_state_id = None
+    first_fault_reason = None
+    recovery_boot_active = False
+    pre_gdb_snapshot_path = None
+    if debug_stop_at == 'cut' and not is_control:
+        try:
+            prepare_recovery_shell_state()
+            pre_gdb_snapshot_path = get_machine_snapshot_path('debug_recovery_shell')
+            save_machine_snapshot(pre_gdb_snapshot_path)
+        except Exception as exc:
+            log('debug: pre-GDB machine snapshot skipped: {}'.format(exc))
+            pre_gdb_snapshot_path = None
+
+    try:
+        if is_control:
+            if debug_stop_at == 'cut':
+                raise RuntimeError('cannot use --stop-at cut on a clean control point')
+            if debug_stop_at == 'first-fault':
+                def _prep_ctrl():
+                    restore_phase1_baseline()
+                    reset_rc_injection_state(enabled=False)
+                    reset_nvmc_for_recovery(
+                        tracking_start=tracking_start_address_config
+                    )
+                    disarm_fault()
+                first_fault_reason = _debug_run_to_first_fault(_prep_ctrl)
+            else:
+                restore_phase1_baseline()
+                reset_rc_injection_state(enabled=False)
+                reset_nvmc_for_recovery(
+                    tracking_start=tracking_start_address_config
+                )
+                disarm_fault()
+            previous_snapshot = _phase2_chain_snapshot()
+            actual_state_id = _debug_persistent_state_from_snapshot(
+                previous_snapshot
+            ).identity_hex().lower()
+            recovery_boot_active = True
+        elif not cuts:
+            if preloaded_state is None:
+                raise RuntimeError(
+                    'point has no cuts and no pre-recovery state snapshot to restore'
+                )
+            if debug_stop_at == 'cut':
+                raise RuntimeError(
+                    'cannot use --stop-at cut on a checkpoint snapshot without a recorded cut sequence'
+                )
+            previous_snapshot = _debug_snapshot_from_persistent_state(
+                preloaded_state
+            )
+            rebuilt_state = _debug_persistent_state_from_snapshot(
+                previous_snapshot
+            )
+            actual_state_id = _debug_verify_rebuilt_state(
+                rebuilt_state,
+                expected_state_id=debug_expected_state_id,
+                expected_payload=expected_payload,
+                preloaded_state=preloaded_state,
+            )
+            if debug_stop_at == 'first-fault':
+                first_fault_reason = _debug_run_to_first_fault(
+                    lambda: _debug_prepare_recovery_boot(previous_snapshot)
+                )
+            else:
+                _debug_prepare_recovery_boot(previous_snapshot)
+            recovery_boot_active = True
+        else:
+            last_cut_is_reset = _debug_cut_is_reset_boundary(cuts[-1][1])
+            if debug_stop_at == 'cut':
+                for idx in range(len(cuts) - 1):
+                    c_at, c_code = cuts[idx]
+                    previous_snapshot, _ = _debug_run_cut_segment(
+                        idx, c_at, c_code, previous_snapshot, stop_at_this_cut=False
+                    )
+                final_idx = len(cuts) - 1
+                f_at, f_code = cuts[final_idx]
+                previous_snapshot, last_arm_meta = _debug_run_cut_segment(
+                    final_idx, f_at, f_code, previous_snapshot, stop_at_this_cut=True
+                )
+                rebuilt_state = _debug_persistent_state_from_snapshot(previous_snapshot)
+                if last_cut_is_reset:
+                    actual_state_id = _debug_verify_rebuilt_state(
+                        rebuilt_state,
+                        expected_state_id=debug_expected_state_id,
+                        expected_payload=expected_payload,
+                        preloaded_state=preloaded_state,
+                    )
+                else:
+                    actual_state_id = rebuilt_state.identity_hex().lower()
+                recovery_boot_active = not last_cut_is_reset
+            elif debug_stop_at == 'first-fault':
+                if last_cut_is_reset:
+                    for idx, (c_at, c_code) in enumerate(cuts):
+                        previous_snapshot, last_arm_meta = _debug_run_cut_segment(
+                            idx, c_at, c_code, previous_snapshot, stop_at_this_cut=False
+                        )
+                    rebuilt_state = _debug_persistent_state_from_snapshot(previous_snapshot)
+                    actual_state_id = _debug_verify_rebuilt_state(
+                        rebuilt_state,
+                        expected_state_id=debug_expected_state_id,
+                        expected_payload=expected_payload,
+                        preloaded_state=preloaded_state,
+                    )
+                    first_fault_reason = _debug_run_to_first_fault(
+                        lambda: _debug_prepare_recovery_boot(previous_snapshot)
+                    )
+                    recovery_boot_active = True
+                else:
+                    for idx in range(len(cuts) - 1):
+                        c_at, c_code = cuts[idx]
+                        previous_snapshot, _ = _debug_run_cut_segment(
+                            idx, c_at, c_code, previous_snapshot, stop_at_this_cut=False
+                        )
+                    final_idx = len(cuts) - 1
+                    f_at, f_code = cuts[final_idx]
+                    meta_box = [None]
+
+                    def _prep_sb():
+                        meta_box[0] = _debug_prepare_and_arm_cut(
+                            final_idx, f_at, f_code, previous_snapshot
+                        )
+
+                    first_fault_reason = _debug_run_to_first_fault(
+                        _prep_sb,
+                        single_boot_code=f_code,
+                        single_boot_meta_box=meta_box,
+                    )
+                    last_arm_meta = meta_box[0] or {}
+                    previous_snapshot = _phase2_chain_snapshot()
+                    actual_state_id = _debug_persistent_state_from_snapshot(
+                        previous_snapshot
+                    ).identity_hex().lower()
+                    recovery_boot_active = True
+            else:
+                # Default: --stop-at recovery-reset
+                if not last_cut_is_reset and not cuts[-1][1].startswith(('m:', 'nv:')):
+                    raise RuntimeError(
+                        'fault type {!r} has no recovery reset; use --stop-at cut or --stop-at first-fault'.format(
+                            cuts[-1][1]
+                        )
+                    )
+                for idx, (c_at, c_code) in enumerate(cuts):
+                    previous_snapshot, last_arm_meta = _debug_run_cut_segment(
+                        idx, c_at, c_code, previous_snapshot, stop_at_this_cut=False
+                    )
+                rebuilt_state = _debug_persistent_state_from_snapshot(previous_snapshot)
+                actual_state_id = _debug_verify_rebuilt_state(
+                    rebuilt_state,
+                    expected_state_id=debug_expected_state_id,
+                    expected_payload=expected_payload,
+                    preloaded_state=preloaded_state,
+                )
+                if not last_arm_meta.get('pre_boot'):
+                    _debug_prepare_recovery_boot(previous_snapshot)
+                recovery_boot_active = True
+    except Exception as exc:
+        _debug_write_ready_payload({
+            'ready': False,
+            'error': str(exc),
+        })
+        raise
+
+    # Ensure machine is paused and CPU is unhalted so GdbStub can step/continue
+    monitor.Parse('machine Pause')
+    cpu_ref = monitor.Machine['sysbus.cpu']
+    cpu_ref.IsHalted = False
+    arm_vtor_watchpoint()
+
+    initial_pc = as_int(cpu_ref.GetRegisterUnsafe(15))
+    initial_sp = as_int(cpu_ref.GetRegisterUnsafe(13))
+    initial_lr = as_int(cpu_ref.GetRegisterUnsafe(14))
+    initial_vtor = as_int(bus.ReadDoubleWord(0xE000ED08))
+
+    monitor.Parse('machine StartGdbServer {} true'.format(int(debug_gdb_port)))
+    try:
+        monitor.Machine.IsGdbConnectedToServer(int(debug_gdb_port))
+    except Exception as exc:
+        _debug_write_ready_payload({
+            'ready': False,
+            'error': 'failed to start Renode GDB server on port {}: {}'.format(
+                int(debug_gdb_port), exc
+            ),
+        })
+        raise
+    ready_payload = {
+        'ready': True,
+        'port': int(debug_gdb_port),
+        'stop_at': debug_stop_at,
+        'pc': fmt_u32(initial_pc),
+        'sp': fmt_u32(initial_sp),
+        'lr': fmt_u32(initial_lr),
+        'vtor': fmt_u32(initial_vtor),
+        'state_identity': actual_state_id,
+        'fault_at': int(fault_at),
+        'fault_type': ft,
+    }
+    if first_fault_reason is not None:
+        ready_payload['first_fault_reason'] = first_fault_reason
+    _debug_write_ready_payload(ready_payload)
+    log(
+        'debug: GDB server listening on port {} (stop_at={} pc={} sp={} state={})'.format(
+            debug_gdb_port,
+            debug_stop_at,
+            fmt_u32(initial_pc),
+            fmt_u32(initial_sp),
+            actual_state_id,
+        )
+    )
+
+    m_ref = monitor.Machine
+    deadline = _time.time() + max(1.0, float(debug_timeout_s))
+    gdb_ever_connected = False
+    gdb_terminal_reason = None
+    boot_start_virtual_s = _debug_read_machine_virtual_s(m_ref)
+    last_progress_virtual_s = boot_start_virtual_s
+    last_progress_wall_s = _time.time()
+    last_progress_key = None
+    vtor_captured_virtual_s = None
+    vtor_captured_polls = 0
+    settle_virtual_s = max(0.005, float(_copy_on_boot_vtor_settle_iters()) * 0.02)
+    last_running_pc = None
+    last_running_insns = None
+    terminal_loop_hits = 0
+    pc_handoff_slot = success_pc_slot if success_pc_slot in slot_ranges else None
+    timed_out = False
+
+    try:
+        while _time.time() < deadline:
+            connected = False
+            try:
+                connected = bool(m_ref.IsGdbConnectedToServer(int(debug_gdb_port)))
+            except Exception:
+                connected = False
+            if connected:
+                gdb_ever_connected = True
+            elif gdb_ever_connected:
+                break
+
+            is_continuing = False
+            if connected:
+                try:
+                    exec_mode = str(getattr(cpu_ref, 'ExecutionMode', ''))
+                    is_continuing = (exec_mode == 'Continuous')
+                except Exception:
+                    is_continuing = not bool(getattr(m_ref, 'IsPaused', True))
+
+            if is_continuing:
+                now_virtual_s = _debug_read_machine_virtual_s(m_ref)
+                now_wall_s = _time.time()
+                pc_now = as_int(cpu_ref.GetRegisterUnsafe(15))
+                try:
+                    cur_insns = as_int(cpu_ref.ExecutedInstructions)
+                except Exception:
+                    cur_insns = None
+                vtor_now = as_int(bus.ReadDoubleWord(0xE000ED08))
+                if vtor_now != 0:
+                    for sn, (s_lo, s_hi) in slot_ranges.items():
+                        if s_lo <= vtor_now < s_hi:
+                            sticky_vtor['value'] = vtor_now
+                            sticky_vtor['slot'] = sn
+                            sticky_vtor['captured'] = True
+                            break
+                capture_sticky_pc(pc_now)
+                cur_w = get_total_writes()
+                cur_e = get_total_erases()
+                p_key = (cur_w, cur_e, bool(sticky_vtor['captured']), pc_now & ~1, cur_insns)
+                if last_progress_key is None or p_key != last_progress_key:
+                    last_progress_key = p_key
+                    last_progress_virtual_s = now_virtual_s
+                    last_progress_wall_s = now_wall_s
+
+                if sticky_vtor['captured']:
+                    vtor_captured_polls += 1
+                    if vtor_captured_virtual_s is None:
+                        vtor_captured_virtual_s = now_virtual_s
+                    elif (
+                        (now_virtual_s - vtor_captured_virtual_s) >= settle_virtual_s
+                        or vtor_captured_polls >= 2
+                    ):
+                        gdb_terminal_reason = 'vtor_captured'
+                        vtor_captured_polls = 0
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                elif (
+                    pc_handoff_slot is not None
+                    and sticky_pc['captured']
+                    and sticky_pc.get('slot') == pc_handoff_slot
+                ):
+                    gdb_terminal_reason = 'pc_captured'
+                    _debug_pause_for_gdb(m_ref, cpu_ref)
+                elif check_console_fatal():
+                    gdb_terminal_reason = 'console_fatal'
+                    _debug_pause_for_gdb(m_ref, cpu_ref)
+                elif (
+                    bool(getattr(cpu_ref, 'IsLockedUp', False))
+                    or (pc_now & ~1) == 0xEFFFFFFE
+                ):
+                    gdb_terminal_reason = 'cpu_lockup'
+                    _debug_pause_for_gdb(m_ref, cpu_ref)
+                else:
+                    is_halt_pc = _debug_is_terminal_halt_pc(cpu_ref, pc_now)
+                    insns_stalled = (
+                        cur_insns is not None
+                        and last_running_insns is not None
+                        and cur_insns == last_running_insns
+                    )
+                    if last_running_pc == (pc_now & ~1) and (is_halt_pc or insns_stalled):
+                        terminal_loop_hits += 1
+                    else:
+                        terminal_loop_hits = 0
+                    last_running_pc = pc_now & ~1
+                    last_running_insns = cur_insns
+                    if terminal_loop_hits >= 2:
+                        gdb_terminal_reason = 'no_boot_terminal_loop'
+                        terminal_loop_hits = 0
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif (
+                        progress_stall_timeout_s > 0
+                        and (
+                            (now_virtual_s - last_progress_virtual_s)
+                            >= max(0.1, float(progress_stall_timeout_s))
+                            or (now_wall_s - last_progress_wall_s)
+                            >= max(1.5, float(progress_stall_timeout_s) * 5.0)
+                        )
+                    ):
+                        gdb_terminal_reason = 'no_boot_stall'
+                        last_progress_wall_s = now_wall_s
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+                    elif (now_virtual_s - boot_start_virtual_s) >= max(
+                        2.0, parse_duration_seconds(default=2.0)
+                    ):
+                        gdb_terminal_reason = 'budget'
+                        _debug_pause_for_gdb(m_ref, cpu_ref)
+            _time.sleep(0.02)
+        else:
+            timed_out = True
+    finally:
+        disarm_vtor_watchpoint()
+        _debug_restore_continuous_execution(cpu_ref)
+        try:
+            monitor.Parse('machine Pause')
+        except Exception:
+            pass
+        try:
+            monitor.Parse('machine StopGdbServer {}'.format(int(debug_gdb_port)))
+        except Exception:
+            pass
+        _debug_restore_continuous_execution(cpu_ref)
+
+    if timed_out:
+        raise RuntimeError(
+            'debug session timed out after {}s'.format(debug_timeout_s)
+        )
+
+    # Evaluate final recovery outcome
+    p2_status = None
+    if not recovery_boot_active:
+        # Session stopped at cut on a power-loss cut; now run recovery boot from previous_snapshot
+        if pre_gdb_snapshot_path is not None and os.path.isfile(pre_gdb_snapshot_path):
+            try:
+                load_machine_snapshot(pre_gdb_snapshot_path)
+            except Exception as exc:
+                log('debug: pre-GDB machine snapshot load skipped: {}'.format(exc))
+        _debug_prepare_recovery_boot(previous_snapshot)
+        cpu_ref = monitor.Machine['sysbus.cpu']
+        _debug_restore_continuous_execution(cpu_ref)
+        cpu_ref.IsHalted = False
+        arm_vtor_watchpoint()
+        try:
+            p2_status = run_until_done(
+                cpu_ref,
+                label='debug_post_cut_recovery',
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=phase2_wall_timeout_s,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+                reset_already_observed=True,
+                effective_criteria=eff_criteria,
+                fault_injected=(not is_control),
+            )
+        finally:
+            disarm_vtor_watchpoint()
+    elif gdb_terminal_reason is None:
+        # Debugger detached before boot reached a terminal state; finish boot
+        cpu_ref = monitor.Machine['sysbus.cpu']
+        cpu_ref.IsHalted = False
+        arm_vtor_watchpoint()
+        try:
+            p2_status = run_until_done(
+                cpu_ref,
+                label='debug_finish_recovery',
+                expect_writes=False,
+                zero_writes_is_brick=False,
+                wall_timeout=phase2_wall_timeout_s,
+                stop_on_fault=False,
+                time_slice=phase2_time_slice,
+                reset_already_observed=True,
+                effective_criteria=eff_criteria,
+                fault_injected=(not is_control),
+            )
+        finally:
+            disarm_vtor_watchpoint()
+    else:
+        end_virtual_s = _debug_read_machine_virtual_s(m_ref)
+        console_state = capture_console_state(
+            include_recent=(gdb_terminal_reason == 'console_fatal')
+        )
+        p2_status = {
+            'iters': 1,
+            'reason': gdb_terminal_reason,
+            'elapsed_s': round(_time.time() - started, 6),
+            'emulated_s': round(max(0.0, end_virtual_s - boot_start_virtual_s), 6),
+            'writes': get_total_writes(),
+            'erases': get_total_erases(),
+            'pc': fmt_u32(as_int(cpu_ref.GetRegisterUnsafe(15))),
+            'console_attached_names': console_state.get('attached_names', []),
+            'console_attached_count': console_state.get('attached_count', 0),
+            'console_last_line': console_state.get('last_line'),
+            'console_last_lines': console_state.get('last_lines', []),
+            'console_recent_logs': console_state.get('recent_logs', []),
+            'console_fatal_pattern': check_console_fatal(),
+        }
+
+    vtor_value = as_int(bus.ReadDoubleWord(0xE000ED08))
+    pc_value = as_int(cpu_ref.GetRegisterUnsafe(15))
+    boot_outcome, boot_slot, signals = evaluate_boot_outcome(
+        vtor_value,
+        pc_value,
+        fault_injected=(not is_control),
+        effective_criteria=eff_criteria,
+        p2_status=p2_status,
+    )
+    uncorr_addrs = (
+        previous_snapshot.get('uncorrectable_addresses', ())
+        if isinstance(previous_snapshot, dict)
+        else ()
+    )
+    attach_uncorr_fn = globals().get('_attach_uncorrectable_read_signals')
+    if callable(attach_uncorr_fn):
+        attach_uncorr_fn(
+            signals,
+            boot_outcome,
+            p2_status=p2_status,
+            marked_at_fault=uncorr_addrs,
+            torn_word_mode=mram_torn_word,
+        )
+    if p2_status is not None:
+        merge_stop_status_signals(signals, 'phase2', p2_status)
+
+    fault_addr = int(last_arm_meta.get('fault_address', 0) or 0)
+    snap_bytes = (
+        bytearray(to_py_bytes(previous_snapshot['flash']))
+        if isinstance(previous_snapshot, dict) and previous_snapshot.get('flash') is not None
+        else None
+    )
+    extra_fields = {
+        'debug_session': {
+            'stop_at': debug_stop_at,
+            'port': int(debug_gdb_port),
+            'initial_pc': fmt_u32(initial_pc),
+            'initial_sp': fmt_u32(initial_sp),
+            'initial_lr': fmt_u32(initial_lr),
+            'initial_vtor': fmt_u32(initial_vtor),
+            'final_pc': fmt_u32(pc_value),
+            'final_vtor': fmt_u32(vtor_value),
+            'state_identity': actual_state_id,
+            'gdb_connected': bool(gdb_ever_connected),
+            'gdb_terminal_reason': gdb_terminal_reason,
+            'first_fault_reason': first_fault_reason,
+        },
+    }
+    return _build_fault_result(
+        fault_at,
+        'control' if is_control else ft,
+        not is_control,
+        fault_addr,
+        get_total_writes(),
+        signals,
+        boot_outcome=boot_outcome,
+        boot_slot=boot_slot,
+        eff_criteria=eff_criteria,
+        p2_status=p2_status,
+        followup_label='debug_followup',
+        saved_flash=(
+            previous_snapshot.get('flash')
+            if isinstance(previous_snapshot, dict)
+            else None
+        ),
+        fault_snapshot_bytes=snap_bytes,
+        extra_fields=extra_fields,
+        fault_uncorrectable_words=list(uncorr_addrs),
+    )
 
 
 if calibration_mode:
@@ -20991,6 +22806,27 @@ if calibration_mode:
     with open(result_file, 'w') as f:
         f.write(_json_dump_text(result))
     log('calibration done: total_writes={}'.format(result.get('total_writes', '?')))
+
+elif debug_mode:
+    fp = fault_points[0] if fault_points else int(monitor.GetVariable('fault_at'))
+    ft = fault_type_list[0] if fault_type_list else 'w'
+    if ft == 'f':
+        ensure_read_fault_preflight()
+    point_torn_word = _select_point_mram_torn_word(fp)
+    point_flash_torn_word = _select_point_torn_word(fp)
+    result = run_debug_session(fp, ft)
+    result = annotate_boot_span_result(
+        annotate_update_sequence_result(
+            _finalize_recovery_marker_precondition_result(result)
+        )
+    )
+    _record_point_mram_torn_word(result, point_torn_word)
+    _record_point_torn_word(result, point_flash_torn_word)
+    with open(result_file, 'w') as f:
+        f.write(_json_dump_text(result))
+    log('debug session done: outcome={} class={}'.format(
+        result.get('boot_outcome'), result.get('fault_class')
+    ))
 
 else:
     # -------------------------------------------------------------------

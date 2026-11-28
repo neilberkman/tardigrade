@@ -54,11 +54,16 @@ def _decode_pre_recovery_state(encoded):
             addr = int(str(item), 0)
             if addr >= base:
                 marks.append(("nvm", addr - base))
+        persistent_values = {}
+        for name, val_b64 in (encoded.get("persistent_values") or {}).items():
+            if isinstance(val_b64, str) and val_b64:
+                persistent_values[str(name)] = bytearray(base64.b64decode(val_b64))
         return PersistentState.from_bytes(
             bytearray(raw),
             name="nvm",
             base_address=base,
             uncorrectable_words=tuple(marks),
+            persistent_values=persistent_values,
         )
     except Exception:
         return None
