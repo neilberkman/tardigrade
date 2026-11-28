@@ -139,6 +139,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public bool WriteTraceEnabled { get => tracker.WriteTraceEnabled; set => tracker.WriteTraceEnabled = value; }
         public int WriteTraceCount => tracker.WriteTraceCount;
         public string WriteTraceToString() => tracker.WriteTraceToString();
+        public RecoveryTraceTimes TraceTimes => tracker.TraceTimes;
         public string WriteCallContextToString() => tracker.WriteCallContextToString();
         public void WriteTraceClear() => tracker.WriteTraceClear();
         // WEN diffing reconstructs aligned four-byte word writes, so every

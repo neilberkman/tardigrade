@@ -2902,6 +2902,9 @@ def _main_single() -> int:
                 for name, slot in (getattr(profile.memory, "slots", None) or {}).items()
             },
         )
+        for row in sweep_results:
+            if row.get("recovery_trace_comparison"):
+                print(row["error"], file=sys.stderr)
         planned_fault_types = (
             list(fault_types_list)
             if fault_types_list is not None

@@ -82,3 +82,88 @@ def test_interrupted_program_compares_issued_data():
     b = [dict(write(2, 0x00cd), intended_value=0xabcd)]
     assert compare(a, b)["classification"] == "identical traces"
 
+
+def test_same_path_repeat_labels_the_second_observation():
+    from recovery_trace_comparison import compare_recovery_traces, comparison_message
+    result = compare_recovery_traces([write(0, 2)], [write(0, 3)], "a", "a", 0, 255,
+                                     other_side="repeat")
+    assert result["trace_lengths"] == {"computed": 1, "repeat": 1}
+    assert result["first_differing_operation"]["repeat"]["data"] == "0300"
+    assert "repeat write" in comparison_message(result)
+
+
+def test_preflight_samples_distinct_selected_first_cuts_in_trace_order():
+    from recovery_search import RecoveryStateExplorer
+    from recovery_state import PersistentState, merge_operation_traces
+
+    operations = merge_operation_traces([
+        dict(write_index=i + 1, offset=0, width=2, value=v)
+        for i, v in enumerate([2, 2, 3, 4])
+    ], [])
+    explorer = RecoveryStateExplorer(
+        PersistentState.from_bytes(b"\x00\x00"), operations, range(4), 2, 4, 10,
+        lambda: 0, lambda *args: pytest.fail("sampling issued a recovery boot"),
+        backend_kind="mram", torn_word_mode="programmed")
+    assert [chain[0]["operation_index"] for _, chain in explorer.preflight_states(2)] == [0, 2]
+    assert list(explorer.preflight_states(0)) == []
+
+
+def test_preflight_option_survives_strict_profile_loading(tmp_path):
+    from profile_loader import load_profile
+    root = Path(__file__).resolve().parents[1]
+    base = root / "examples/phase2_mram_parity/profile_state_search.yaml"
+    profile = tmp_path / "preflight.yaml"
+    profile.write_text(base.read_text().replace("cross_check_every: 1",
+                                               "cross_check_every: 1\n      determinism_preflight: 3"))
+    config = load_profile(profile, strict=True).fault_sweep.phase2_fault.state_search
+    assert config.to_runtime_dict()["determinism_preflight"] == 3
+
+
+@pytest.mark.parametrize("length", [2, 3])
+def test_missed_live_cut_retains_comparison_in_infrastructure_result(length):
+    from test_phase2_fault_parity import _load_state_search_live_cross_check
+    from recovery_trace_comparison import RecoveryTraceMismatch, compare_recovery_traces
+
+    chain = [dict(operation_index=0, operation="write", trace_sequence=0) for _ in range(length)]
+
+    def missed(*args, diagnostic, **kwargs):
+        diagnostic.update(live=("a", [], "a"), ordinal=length)
+        status = dict(matched=False, infrastructure_error=True, first_unreached_cut=length,
+                      error="missed cut", error_kind="recovery_state_cross_check_cut_not_reached",
+                      live_boot_outcome="success")
+        return {key: {"cross_check_persistent_state": status}
+                for key in ("phase2_fault", "phase2_fault_chain")}
+
+    ns = dict(run_phase2_fault=missed, run_phase2_fault_chain=missed,
+              _replay_storage_geometry=lambda: (0, 16, 4, 255),
+              RecoveryTraceMismatch=RecoveryTraceMismatch, compare_recovery_traces=compare_recovery_traces)
+    _load_state_search_live_cross_check(ns)
+    with pytest.raises(RecoveryTraceMismatch) as error:
+        ns["_state_search_live_cross_check"](object(), chain, length, None,
+                                             lambda cuts: ([write(0, 2)], 10, "a", "a"))
+    report = error.value.result()
+    assert report["boot_outcome"] == "infra_error" and report["infrastructure_error"]
+    assert report["error_kind"] == "recovery_state_cross_check_cut_not_reached"
+    assert "one boot ended early" in report["error"]
+    comparison = report["recovery_trace_comparison"]
+    assert comparison["trace_lengths"] == {"computed": 1, "live": 0}
+    assert comparison["computed_full_trace_length"] == 10
+    assert comparison["first_unreached_cut"] == length
+    assert comparison["live_boot_outcome"] == "success"
+
+@pytest.mark.parametrize("kind", ["write", "erase"])
+def test_truncated_device_export_is_refused(kind):
+    import ast
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[1] / "scripts/run_runtime_fault_sweep.py"
+    node = next(node for node in ast.parse(path.read_text()).body
+                if getattr(node, "name", "") == "_state_search_capture_trace")
+    target = SimpleNamespace(WriteTraceCount=int(kind == "write"), EraseTraceCount=int(kind == "erase"),
+                             WriteTraceToString=lambda: "", EraseTraceToString=lambda: "")
+    ns = dict(_state_search_trace_target=lambda: target, backend={"kind": "fast"},
+              parse_erase_trace_map=lambda *a, **kw: {}, parse_write_trace_map=lambda *a, **kw: {},
+              _state_search_operations_from_maps=lambda writes, erases: [])
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), ns)
+    with pytest.raises(RuntimeError, match="recovery " + kind + " trace"):
+        ns["_state_search_capture_trace"]()

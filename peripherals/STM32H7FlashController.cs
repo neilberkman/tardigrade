@@ -124,6 +124,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 
         public ulong LastFaultPC { get => tracker.LastFaultPC; set => tracker.LastFaultPC = value; }
         public string LastFaultCallContext { get => tracker.LastFaultCallContext; set => tracker.LastFaultCallContext = value; }
+        public RecoveryTraceTimes TraceTimes => tracker.TraceTimes;
         public string WriteCallContextToString() => tracker.WriteCallContextToString();
         public string EraseCallContextToString() => tracker.EraseCallContextToString();
 

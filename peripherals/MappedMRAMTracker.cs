@@ -392,6 +392,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             writeTrace.Clear();
         }
 
+        public RecoveryTraceTimes TraceTimes { get; } = new RecoveryTraceTimes();
+
         public int ProgramTraceCount => programTrace.Count;
         public string ProgramTraceToString()
         {
@@ -652,6 +654,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             TotalPageErases = eraseIndex;
             if(EraseTraceEnabled)
             {
+                TraceTimes.Record(true, eraseIndex);
                 eraseTrace.Add(new EraseTraceEntry(
                     eraseIndex, offset, TotalWordWrites, spanSize, erasePc));
                 if(!string.IsNullOrEmpty(eraseCtx))
@@ -1002,6 +1005,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     uncorrectableWords.Remove(unitOffset);
                 }
 
+                TraceTimes.Record(false, writeIndex);
                 programTrace.Add(new ProgramTraceEntry(
                     writeIndex, unitOffset, ProgramUnitSize,
                     CloneBytes(intended), CloneBytes(preProgram),

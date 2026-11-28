@@ -1253,6 +1253,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             totalPageErases = currentEraseIndex;
             if(eraseTraceEnabled)
             {
+                TraceTimes.Record(true, currentEraseIndex);
                 eraseTrace.Add(new EraseTraceEntry(
                     currentEraseIndex, offset, TotalWordWrites, spanSize, erasePc));
                 if(!string.IsNullOrEmpty(eraseCtx))
@@ -1881,6 +1882,9 @@ namespace Antmicro.Renode.Peripherals.Memory
             ));
         }
 
+        public RecoveryTraceTimes TraceTimes => AliasTarget != null ? AliasTarget.TraceTimes : traceTimes;
+        private readonly RecoveryTraceTimes traceTimes = new RecoveryTraceTimes();
+
         private void RecordProgramTrace(ulong index, long offset, byte[] intended,
                                         byte[] preProgram, byte[] postProgram, bool faulted, ulong pc = 0)
         {
@@ -1889,6 +1893,7 @@ namespace Antmicro.Renode.Peripherals.Memory
             {
                 writeCallContexts[index] = ctx;
             }
+            TraceTimes.Record(false, index);
             programTrace.Add(new ProgramTraceEntry(
                 index, offset, (int)WordSize,
                 CloneBytes(intended), CloneBytes(preProgram), CloneBytes(postProgram),

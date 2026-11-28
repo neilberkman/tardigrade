@@ -1164,6 +1164,7 @@ class RecoveryStateSearchConfig:
         "max_wall_time_s",
         "address_ranges",
         "cross_check_every",
+        "determinism_preflight",
         "shard_count",
         "shard_index",
         "order",
@@ -1188,6 +1189,7 @@ class RecoveryStateSearchConfig:
         shard_index: int = 0,
         order: str = "breadth_first",
         max_boots_without_new_coverage: Optional[int] = None,
+        determinism_preflight: int = 0,
     ) -> None:
         self.enabled = bool(enabled)
         self.plan_only = bool(plan_only)
@@ -1195,6 +1197,11 @@ class RecoveryStateSearchConfig:
             raise ProfileError(
                 "fault_sweep.phase2_fault.state_search.plan_only requires state_search.enabled"
             )
+        if type(determinism_preflight) is not int or not 0 <= determinism_preflight <= MAX_PROFILE_FAULT_POINTS:
+            raise ProfileError("state_search.determinism_preflight must be a non-negative first-cut count")
+        if determinism_preflight and not self.enabled:
+            raise ProfileError("state_search.determinism_preflight requires state_search.enabled")
+        self.determinism_preflight = determinism_preflight
         self.first_cut_mode = str(first_cut_mode).strip().lower()
         self.first_cut_mode_explicit = bool(first_cut_mode_explicit)
         self.use_distinct_first_cuts = bool(
@@ -1308,6 +1315,7 @@ class RecoveryStateSearchConfig:
                 for start, end in self.address_ranges
             ],
             "cross_check_every": self.cross_check_every,
+            **({"determinism_preflight": self.determinism_preflight} if self.determinism_preflight else {}),
             **({"shard_count": self.shard_count, "shard_index": self.shard_index}
                if self.shard_count > 1 else {}),
             "order": self.order,
@@ -6401,6 +6409,7 @@ def _parse_recovery_state_search(raw: Optional[Dict[str, Any]]) -> RecoveryState
         max_wall_time_s=max_wall_time_s,
         address_ranges=address_ranges,
         cross_check_every=int(raw.get("cross_check_every", 100)),
+        determinism_preflight=raw.get("determinism_preflight", 0),
         shard_count=raw.get("shard_count", 1),
         shard_index=raw.get("shard_index", 0),
         order=str(raw.get("order", "breadth_first")),
@@ -9831,7 +9840,7 @@ def _validate_strict_profile_data(data: Dict[str, Any]) -> None:
                 frozenset(
                     {
                         "enabled", "plan_only", "first_cuts", "max_cuts", "max_new_states",
-                        "max_wall_time_s", "address_ranges", "cross_check_every",
+                        "max_wall_time_s", "address_ranges", "cross_check_every", "determinism_preflight",
                         "shard_count", "shard_index",
                         "order", "max_boots_without_new_coverage",
                         "plateau_boots", "recovery_coverage",

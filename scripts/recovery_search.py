@@ -11,6 +11,7 @@ import hashlib
 from bisect import bisect_left
 from collections import defaultdict, deque
 
+from recovery_trace_comparison import RecoveryTraceMismatch
 from recovery_checkpoint import SnapshotWriter, restore_snapshots, validate_checkpoint
 from recovery_state import (
     normalize_trace,
@@ -912,6 +913,8 @@ class RecoveryStateExplorer(object):
         self.summary["cross_checks_run"] += 1
         try:
             outcome = self.cross_check(state, chain, generation, operation)
+        except RecoveryTraceMismatch:
+            raise
         except Exception as exc:
             raise RecoverySearchError(
                 "live cross-check failed for {}: {}".format(
@@ -1121,6 +1124,46 @@ class RecoveryStateExplorer(object):
         chain = self.results[parent]["recovery_state_search"]["chain"]["cuts"]
         return self._traces[parent], tuple(chain)
 
+    def cross_check_source(self, cuts):
+        """Look up the original parent boot only when a live check disagrees."""
+        path = [c["trace_sequence"] for c in cuts[:-1]]
+        for index, result in enumerate(self.results):
+            meta = result["recovery_state_search"]
+            if path == [c["trace_sequence"] for c in meta["chain"]["cuts"]]:
+                ops = self._traces[index]
+                return (ops[:cuts[-1]["trace_sequence"] + 1], len(ops),
+                        result.get("recovery_boot_start_identity"),
+                        result.get("recovery_trace_base_identity"))
+        raise RecoverySearchError("missing computed-source recovery trace")
+
+    def preflight_states(self, count):
+        """Walk calibration once and sample the first distinct selected states."""
+        if count <= 0:
+            return
+        selected = set(self.first_cuts)
+        seen = set()
+        prefix = self.initial_state
+        erases = 0
+        for op in self.calibration_operations:
+            if (op["kind"], op["operation_index"]) in selected:
+                state = self._interrupted_state(prefix, op, (), erases)
+                identity = state.identity_hex()
+                if identity not in seen:
+                    yield state, (format_cut(op, self.flash_base),)
+                    seen.add(identity)
+                    if len(seen) == count:
+                        return
+            prefix = apply_completed_operation(prefix, op, self.erase_fill)
+            erases += op["kind"] == "erase"
+
+    def _interrupted_state(self, prefix, op, chain, erases):
+        return apply_interrupted_operation(
+            prefix, op, backend_kind=self.backend_kind,
+            torn_word_mode=self._mode_for_cut(op, len(chain) + 1, chain),
+            erase_fill=self.erase_fill, corruption_seed=self.corruption_seed,
+            total_erases=erases, page_size=self.page_size, program_unit=self.program_unit,
+        )
+
     def _visit(self, parent, index, state):
         operations, prefix = self._source(parent)
         operation = operations[index]
@@ -1204,12 +1247,7 @@ class RecoveryStateExplorer(object):
         key = (parent, index)
         candidate = self._computed_frontier.get(key)
         if candidate is None:
-            candidate = apply_interrupted_operation(
-                prefix, op, backend_kind=self.backend_kind,
-                torn_word_mode=self._mode_for_cut(op, len(chain) + 1, chain),
-                erase_fill=self.erase_fill, corruption_seed=self.corruption_seed,
-                total_erases=erases, page_size=self.page_size, program_unit=self.program_unit,
-            )
+            candidate = self._interrupted_state(prefix, op, chain, erases)
         if preview:
             self._computed_frontier[key] = candidate
         else:

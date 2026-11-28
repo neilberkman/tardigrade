@@ -2077,8 +2077,8 @@ When reusing a report path, it marks any older checkpoint at that path final.
 A plan-only audit never writes a checkpoint. Resuming requires a normal search.
 
 To size a search, set `plan_only: true` alongside `state_search.enabled: true`
-and run the profile normally. The planner boots each distinct first-cut state
-once. It walks the resulting traces and computes candidate identities in
+and run the profile normally. After the determinism preflight described below,
+the planner boots each distinct first-cut state once. It walks the resulting traces and computes candidate identities in
 memory, ending before generation-two recovery boots and live cross-checks.
 Planning and full search use the same first-cut pass within their respective
 Renode batches.
@@ -2181,6 +2181,38 @@ injector first evaluates that live recovery boot, then reports a
 cut and preserving the live outcome and fault class. It is never accepted as
 a successful comparison. A checked equivalent chain carries its own
 `cross_check` record.
+
+Recovery-state search assumes that restoring the persistent bytes and
+uncorrectable-word marks reproduces the inputs that determine the recovery
+boot's storage operations. A clock or free-running counter that survives
+reset, uninitialized RAM, interrupt timing, entropy, host messages, and a
+stateful harness hook can all break that assumption. For example, writing a
+timestamp to a journal can change its contents while leaving every write
+address unchanged.
+
+On a mismatch, `recovery_trace_comparison` records both starting-state
+digests, the lengths of the two streams through the cut, the full length of
+the computed-source trace, and the first differing operation (zero-based).
+Each side gives the operation, address, width, issued data in memory order,
+PC and virtual microseconds since recovery reset when available. Debug
+information and the captured call chain supply the function and source line.
+For a differing byte the comparison identifies its last completed writer on
+each side and whether the interrupted operation also covered the byte. A missing event denotes an exhausted trace. The report
+distinguishes changed data in the same operations (different inputs to those
+writes), a different operation sequence, a shorter boot, and identical inputs
+and issued operations that produced a different persistent state (a replay
+defect). PC, time and stack metadata help explain a difference but do not
+participate in storage-operation equality.
+
+Set `state_search.determinism_preflight` to a positive count to check that
+many distinct selected first-cut states before admitting any search state.
+For each sample the runner boots the computed first-cut state twice, then
+recreates the first cut with the live injector and traces its recovery to
+completion. The report records both comparisons. A different starting state
+or storage trace stops the search with an infrastructure error. A normal
+search defaults to zero samples. A plan checks at least one state, even if
+periodic cross-checking is disabled. The sample count is limited by the
+number of distinct selected first cuts.
 
 Each returned result is an ordinary recovery result, so follow-up boots,
 hooks, assertions, and invariants run unchanged. `recovery_state_search`

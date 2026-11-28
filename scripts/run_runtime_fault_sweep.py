@@ -53,6 +53,7 @@ from recovery_search import (
     recovery_trace_size,
     select_first_cut_operations,
 )
+from recovery_trace_comparison import RecoveryTraceMismatch, compare_recovery_traces
 from recovery_coverage import resolve_executed_probe_pcs
 from first_cut_states import compute_first_cut_states
 from replay_cross_check import (
@@ -16958,7 +16959,7 @@ def _phase2_chain_restore(snapshot):
     _restore_mram_uncorrectable_offsets(snapshot['uncorrectable_offsets'])
 
 
-def _phase2_chain_cross_check(snapshot, expected):
+def _phase2_chain_cross_check(snapshot, expected, diagnostic=None):
     if expected is None:
         return None
     observed_values = dict(
@@ -16980,6 +16981,8 @@ def _phase2_chain_cross_check(snapshot, expected):
     }
     if mismatch is not None:
         status['first_difference'] = mismatch
+        if diagnostic is not None:
+            return status
         raise RuntimeError(
             'recovery state cross-check mismatch at {} '
             '({}; expected={} observed={})'.format(
@@ -17224,7 +17227,7 @@ def _phase2_chain_evaluated_result(
     return result
 
 
-def run_phase2_fault_chain(cuts, cross_check_expected=None):
+def run_phase2_fault_chain(cuts, cross_check_expected=None, diagnostic=None):
     """Run three through eight live write/erase cuts, then the final boot."""
     cuts = [(int(item[0]), str(item[1])) for item in cuts]
     if not 3 <= len(cuts) <= 8:
@@ -17287,6 +17290,9 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
             _restore_mram_uncorrectable_offsets(carried_offsets)
         _clear_mram_uncorrectable_read_log()
 
+        observation = None
+        if diagnostic is not None and cut_index > 0:
+            observation = _state_search_begin_live_trace(diagnostic)
         drawn_mram = _select_point_mram_torn_word(cut_at)
         applied_mram = mram_torn_word
         drawn_flash = (
@@ -17324,6 +17330,10 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
         )
         disarm_fault()
         injected = was_fault_injected()
+        if observation is not None:
+            cut = (cut_at, 'erase' if cut_type == 'e' else 'write')
+            diagnostic['live'] = _state_search_finish_live_trace(diagnostic, observation, cut if injected else None)
+            diagnostic['ordinal'] = ordinal
         total_ops = get_total_erases() if cut_type == 'e' else get_total_writes()
         fault_address = get_last_write_address()
         _fault_pc_fn = globals().get('get_last_fault_pc')
@@ -17442,8 +17452,11 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
         previous_snapshot = _phase2_chain_snapshot()
 
     cross_check_status = _phase2_chain_cross_check(
-        previous_snapshot, cross_check_expected
+        previous_snapshot, cross_check_expected, diagnostic
     )
+
+    if diagnostic is not None and cross_check_status.get('first_difference'):
+        return {'phase2_fault_chain': {'cross_check_persistent_state': cross_check_status}}
 
     final_started = _time.time()
     _phase2_chain_restore(previous_snapshot)
@@ -17492,7 +17505,7 @@ def run_phase2_fault_chain(cuts, cross_check_expected=None):
 
 
 def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type='w',
-                     cross_check_expected=None):
+                     cross_check_expected=None, diagnostic=None):
     if p1_fault_type in ('e', 'a'):
         capability_check = globals().get('_erase_fault_capability_error')
         capability_error = (
@@ -17745,7 +17758,8 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         p2_flash_torn_word = select_flash_torn_word(p2_fault_at)
     p2_applied_torn_word = mram_torn_word
     p2_trace_enabled = (
-        backend['kind'] == 'fast'
+        diagnostic is None
+        and backend['kind'] == 'fast'
         and all(hasattr(backend['data'], member) for member in (
             'WriteTraceClear', 'WriteTraceEnabled', 'WriteTraceToString',
             'EraseTraceClear', 'EraseTraceEnabled', 'EraseTraceToString',
@@ -17756,6 +17770,20 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         backend['data'].EraseTraceClear()
         backend['data'].WriteTraceEnabled = True
         backend['data'].EraseTraceEnabled = True
+
+    observation = None
+    if diagnostic is not None:
+        observation = _state_search_begin_live_trace(diagnostic)
+        if diagnostic.get('preflight'):
+            disarm_fault()
+            status = run_until_done(cpu_ref, label='preflight_live_recovery',
+                                    time_slice=phase2_time_slice, wall_timeout=60)
+            if status.get('infrastructure_error') or str(status['reason']).startswith(
+                    ('wall_timeout', 'instruction_limit', 'budget')):
+                raise RuntimeError('incomplete live determinism preflight: {}'.format(
+                    status.get('error') or status['reason']))
+            diagnostic['live'] = _state_search_finish_live_trace(diagnostic, observation)
+            return {}
 
     if is_p2_timed:
         # Timed reset during recovery: run for a fractional duration of
@@ -17829,6 +17857,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
         _fault_ctx_fn = globals().get('get_last_fault_call_context')
         p2_fault_call_context = _fault_ctx_fn() if callable(_fault_ctx_fn) else None
 
+    if observation is not None:
+        cut = (p2_fault_at, 'erase' if is_p2_erase else 'write')
+        diagnostic['live'] = _state_search_finish_live_trace(diagnostic, observation, cut if p2_injected else None)
+        diagnostic['ordinal'] = 2
     if p2_trace_enabled:
         backend['data'].WriteTraceEnabled = False
         backend['data'].EraseTraceEnabled = False
@@ -17888,27 +17920,10 @@ def run_phase2_fault(p1_fault_at, p2_fault_at, p1_fault_type='w', p2_fault_type=
                 saved_flash_p2 = flash_ref.ReadBytes(0, flash_size)
 
         if cross_check_expected is not None:
-            cross_check_offsets = _snapshot_mram_uncorrectable_offsets()
-            mismatch = first_persistent_difference(
-                cross_check_expected,
-                {'nvm': bytearray(to_py_bytes(saved_flash_p2))},
-                tuple(('nvm', int(offset)) for offset in cross_check_offsets),
-            )
-            cross_check_persistent_state = {
-                'matched': mismatch is None,
-                'state_identity': cross_check_expected.identity_hex(),
-            }
-            if mismatch is not None:
-                cross_check_persistent_state['first_difference'] = mismatch
-                raise RuntimeError(
-                    'recovery state cross-check mismatch at {} '
-                    '({}; expected={} observed={})'.format(
-                        mismatch.get('address', 'unknown address'),
-                        mismatch.get('kind', 'unknown difference'),
-                        mismatch.get('expected', 'n/a'),
-                        mismatch.get('observed', 'n/a'),
-                    )
-                )
+            snapshot = {'flash': saved_flash_p2, 'uncorrectable_offsets': _snapshot_mram_uncorrectable_offsets()}
+            cross_check_persistent_state = _phase2_chain_cross_check(snapshot, cross_check_expected, diagnostic)
+            if cross_check_persistent_state.get('first_difference'):
+                return {'phase2_fault': {'cross_check_persistent_state': cross_check_persistent_state}}
 
         # --- Phase 3: boot from double-faulted state ---
         phase3_t0 = _time.time()
@@ -20933,7 +20948,7 @@ def _state_search_load_calibration_operations():
     )
 
 
-def _state_search_capture_trace():
+def _state_search_capture_trace(allow_faulted=False):
     target = _state_search_trace_target()
     erase_text = str(target.EraseTraceToString())
     erase_ctx_text = (
@@ -20942,6 +20957,9 @@ def _state_search_capture_trace():
         else None
     )
     erase_map = parse_erase_trace_map(erase_text, call_context_text=erase_ctx_text)
+    if len(erase_map) != int(target.EraseTraceCount) or any(
+            index != i for i, index in enumerate(sorted(erase_map), 1)):
+        raise RuntimeError('recovery erase trace is truncated or non-contiguous')
     if backend.get('kind') == 'mram':
         write_ctx_text = (
             str(target.WriteCallContextToString())
@@ -20970,7 +20988,7 @@ def _state_search_capture_trace():
             if (
                 int(event['write_index']) != expected_index
                 or width != program_unit
-                or event.get('faulted')
+                or (event.get('faulted') and not allow_faulted)
             ):
                 raise RuntimeError(
                     'recovery state search requires contiguous clean whole-unit '
@@ -21022,7 +21040,94 @@ def _state_search_capture_trace():
         else None
     )
     write_map = parse_write_trace_map(write_text, call_context_text=write_ctx_text)
+    if len(write_map) != int(target.WriteTraceCount):
+        raise RuntimeError('recovery write trace count disagrees with exported trace')
     return _state_search_operations_from_maps(write_map, erase_map)
+
+
+def _state_search_begin_observation():
+    target = _state_search_trace_target()
+    base, size, _, _ = _replay_storage_geometry()
+    initial = PersistentState.from_bytes(
+        bytearray(to_py_bytes(_replay_storage_read_bytes(0, size))),
+        base_address=base, uncorrectable_words=_snapshot_mram_uncorrectable_offsets(),
+    )
+    clock = getattr(target, 'TraceTimes', None)
+    if clock is not None:
+        if backend['kind'] == 'slow' and hasattr(target, 'ProgramTraceClear'):
+            target.ProgramTraceClear()
+        clock.Begin(monitor.Machine)
+    return initial.identity_hex(), clock
+
+
+def _state_search_timestamp(operations, clock):
+    if clock is None:
+        return
+    for op in operations:
+        elapsed = clock.Microseconds(op['kind'] == 'erase', op['operation_index'] + 1)
+        if elapsed >= 0:
+            op['virtual_us_since_reset'] = float(elapsed)
+    target = _state_search_trace_target()
+    if backend['kind'] == 'slow' and hasattr(target, 'ProgramTraceToString'):
+        # The legacy integer trace contains post-program storage, including
+        # torn bytes on a live cut. Compare the data issued by the CPU instead.
+        events = parse_mram_program_trace(target.ProgramTraceToString(), int(target.Size),
+                                          int(backend.get('bus_base') or 0))
+        writes = [op for op in operations if op['kind'] == 'write']
+        if len(events) != len(writes):
+            raise RuntimeError('recovery program and write trace lengths disagree')
+        for event, op in zip(events, writes):
+            if (event['write_index'], event['offset'], event['program_width']) != (
+                    op['write_index'], op['offset'], op['width']):
+                raise RuntimeError('recovery program and write traces disagree on operation')
+            op['intended_value'] = _little_endian_trace_value(
+                _decode_exact_program_bytes(event['intended_bytes'], op['width'], 'intended bytes'))
+
+
+def _state_search_begin_live_trace(diagnostic):
+    target = _state_search_trace_target()
+    if hasattr(target, 'ProgramTraceClear'):
+        target.ProgramTraceClear()
+    if backend['kind'] != 'mram':
+        target.WriteTraceClear()
+        target.WriteTraceEnabled = True
+    target.EraseTraceClear()
+    target.EraseTraceEnabled = True
+    initial, clock = _state_search_begin_observation()
+    diagnostic['active_trace'] = (target, clock)
+    return initial, clock
+
+
+def _state_search_end_live_trace(diagnostic):
+    target, clock = diagnostic.pop('active_trace')
+    if clock is not None:
+        clock.End()
+    if hasattr(target, 'WriteTraceEnabled'):
+        target.WriteTraceEnabled = False
+    target.EraseTraceEnabled = False
+
+
+def _state_search_finish_live_trace(diagnostic, observation, injected_cut=None):
+    initial, clock = observation
+    _state_search_end_live_trace(diagnostic)
+    operations = _state_search_capture_trace(allow_faulted=True)
+    _state_search_timestamp(operations, clock)
+    if injected_cut is not None:
+        # The backing store froze at the injected operation. A time slice can
+        # still contain later CPU activity, which did not supply that snapshot.
+        index, kind = injected_cut
+        for pos, op in enumerate(operations):
+            if op['operation_index'] == index and op['kind'] == kind:
+                operations = operations[:pos + 1]
+                break
+        else:
+            raise RuntimeError('live recovery trace is missing the injected operation')
+    tracking_base = initial
+    if backend['kind'] == 'mram' and _recovery_tracking_start():
+        boundary = _tracking_base_state_from_peripheral(require_available=False)
+        if boundary is not None:
+            tracking_base = boundary.identity_hex()
+    return initial, operations, tracking_base
 
 
 def _state_search_enable_operation_trace(target):
@@ -21161,9 +21266,14 @@ def _state_search_boot_state(state, chain, generation):
 
     target = _state_search_trace_target()
     capture_recovery_trace = _state_search_should_capture_trace(generation)
+    start_identity = None
+    trace_clock = None
     operation_trace_mode = 'disabled_terminal_generation'
     if capture_recovery_trace:
         operation_trace_mode = _state_search_enable_operation_trace(target)
+        if (phase2_state_search.get('cross_check_every', 100)
+                or phase2_state_search.get('determinism_preflight') or phase2_state_search.get('plan_only')):
+            start_identity, trace_clock = _state_search_begin_observation()
     cpu_ref = monitor.Machine['sysbus.cpu']
     cpu_ref.IsHalted = False
     eff_criteria = get_effective_criteria('p2')
@@ -21183,6 +21293,8 @@ def _state_search_boot_state(state, chain, generation):
             fault_injected=True,
         )
     finally:
+        if trace_clock is not None:
+            trace_clock.End()
         disarm_vtor_watchpoint()
         if capture_recovery_trace:
             if hasattr(target, 'WriteTraceEnabled'):
@@ -21207,6 +21319,7 @@ def _state_search_boot_state(state, chain, generation):
     ) = _state_search_resolve_recovery_trace(
         state, capture_recovery_trace, recovery_start
     )
+    _state_search_timestamp(recovery_operations, trace_clock)
     _state_breakdown['trace_export_s'] = round(
         max(0.0, _time.time() - trace_export_started), 6
     )
@@ -21244,6 +21357,9 @@ def _state_search_boot_state(state, chain, generation):
     signals['recovery_state_generation'] = int(generation)
     recovery_tracking_gate = None
     state_search_extra_fields = {'recovery_writes': recovery_writes}
+    if start_identity is not None:
+        state_search_extra_fields['recovery_boot_start_identity'] = start_identity
+        state_search_extra_fields['recovery_trace_base_identity'] = recovery_trace_base.identity_hex()
     if recovery_tracking_start_address is not None:
         state_search_extra_fields['recovery_tracking_start_address'] = fmt_u32(recovery_start)
     if chain and chain[-1].get('pc'):
@@ -21294,7 +21410,7 @@ def _state_search_boot_state(state, chain, generation):
     return result, recovery_operations, recovery_trace_base
 
 
-def _state_search_live_cross_check(state, chain, generation, operation):
+def _state_search_live_cross_check(state, chain, generation, operation, source_for=None):
     global _in_live_cross_check
     if int(generation) < 2 or len(chain) < 2:
         return False
@@ -21305,6 +21421,8 @@ def _state_search_live_cross_check(state, chain, generation, operation):
         )
         for cut in chain
     ]
+    diagnostic = {}
+    options = {'diagnostic': diagnostic} if source_for is not None else {}
     prev_live_flag = globals().get('_in_live_cross_check', False)
     _in_live_cross_check = True
     try:
@@ -21314,20 +21432,44 @@ def _state_search_live_cross_check(state, chain, generation, operation):
                 live_cuts[1][0],
                 live_cuts[0][1],
                 live_cuts[1][1],
-                cross_check_expected=state,
+                cross_check_expected=state, **options
             )
             status = live_result.get('phase2_fault', {}).get(
                 'cross_check_persistent_state'
             )
         else:
             live_result = run_phase2_fault_chain(
-                live_cuts, cross_check_expected=state
+                live_cuts, cross_check_expected=state, **options
             )
             status = live_result.get('phase2_fault_chain', {}).get(
                 'cross_check_persistent_state'
             )
     finally:
         _in_live_cross_check = prev_live_flag
+        if 'active_trace' in diagnostic:
+            _state_search_end_live_trace(diagnostic)
+    if isinstance(status, dict) and not status.get('matched') and diagnostic.get('live') is not None:
+        ordinal = diagnostic['ordinal']
+        expected, full_length, computed_start, computed_base = source_for(chain[:ordinal])
+        live_start, live, live_base = diagnostic['live']
+        base, _, _, fill = _replay_storage_geometry()
+        difference = status.get('first_difference')
+        comparison = compare_recovery_traces(
+            expected, live, computed_start, live_start, base, fill, difference,
+            cut_reached=difference is not None, trace_bases=(computed_base, live_base))
+        comparison['cuts'] = list(chain[:ordinal])
+        if status.get('first_unreached_cut'):
+            comparison['first_unreached_cut'] = status['first_unreached_cut']
+            comparison['live_boot_outcome'] = status.get('live_boot_outcome')
+            comparison['live_fault_class'] = status.get('live_fault_class')
+        comparison['computed_full_trace_length'] = full_length
+        comparison['cut'] = ordinal
+        reason = status.get('error')
+        if difference:
+            reason = 'recovery state cross-check mismatch at {} ({}; expected={} observed={})'.format(
+                difference.get('address', difference.get('name')), difference['kind'],
+                difference.get('expected'), difference.get('observed'))
+        raise RecoveryTraceMismatch(reason, comparison, status.get('error_kind', 'recovery_state_cross_check_mismatch'))
     if isinstance(status, dict) and status.get('infrastructure_error'):
         raise RuntimeError(status.get(
             'error',
@@ -21351,6 +21493,49 @@ def _state_search_apply_distinct_first_cuts(selected, first_cut_analysis):
         (representative['operation'], int(representative['operation_index']))
         for representative in first_cut_analysis.get('selected_representatives', ())
     )
+
+
+def _state_search_determinism_preflight(state, chain, base, fill, deadline):
+    global _in_live_cross_check
+    def check_deadline():
+        if _time.time() >= deadline:
+            raise RuntimeError('incomplete determinism preflight: max_wall_time_s reached')
+
+    def computed_observation():
+        check_deadline()
+        row, trace, _ = _state_search_boot_state(state, chain, 1)
+        if row.get('infrastructure_error') or row.get('boot_outcome') in ('timeout', 'infra_error'):
+            raise RuntimeError('incomplete computed-source determinism preflight')
+        return row, trace
+
+    source, operations = computed_observation()
+    repeat, repeated = computed_observation()
+    check_deadline()
+    first = chain[0]
+    diagnostic = {'preflight': True}
+    previous = _in_live_cross_check
+    _in_live_cross_check = True
+    try:
+        run_phase2_fault(first['operation_index'], 0, 'e' if first['operation'] == 'erase' else 'w',
+                         cross_check_expected=state, diagnostic=diagnostic)
+    finally:
+        _in_live_cross_check = previous
+        if 'active_trace' in diagnostic:
+            _state_search_end_live_trace(diagnostic)
+    if 'live' not in diagnostic:
+        raise RuntimeError('determinism preflight live boot did not reach the selected first cut')
+    check_deadline()
+    live_start, live, live_base = diagnostic['live']
+    source_base = source['recovery_trace_base_identity']
+    source_start = source['recovery_boot_start_identity']
+    return {
+        'first_cut': first,
+        'computed_vs_live': compare_recovery_traces(
+            operations, live, source_start, live_start, base, fill, trace_bases=(source_base, live_base)),
+        'computed_vs_repeat': compare_recovery_traces(
+            operations, repeated, source_start, repeat['recovery_boot_start_identity'], base, fill,
+            trace_bases=(source_base, repeat['recovery_trace_base_identity']), other_side='repeat'),
+    }
 
 
 def run_recovery_state_search():
@@ -21472,7 +21657,8 @@ def run_recovery_state_search():
             phase2_state_search.get('fault_types') or ('power_loss',)
         ),
         cross_check_every=int(phase2_state_search.get('cross_check_every', 100)),
-        cross_check=_state_search_live_cross_check,
+        cross_check=lambda state, chain, generation, op: _state_search_live_cross_check(
+            state, chain, generation, op, explorer.cross_check_source),
         plan_only=phase2_state_search.get('plan_only', False),
         order=str(
             phase2_state_search.get('order', 'breadth_first')
@@ -21506,7 +21692,37 @@ def run_recovery_state_search():
                     return [{'fault_at': 0, 'fault_requested': 0, 'fault_type': 'rs',
                              'fault_injected': False, 'boot_outcome': 'infra_error',
                              'infrastructure_error': True, 'error': str(exc), 'signals': {}}]
-    results, summary = explorer.run()
+    samples = int(phase2_state_search.get('determinism_preflight', 0))
+    if explorer.plan_only:
+        samples = max(1, samples)
+    preflight = []
+    preflight_started = _time.time()
+    deadline = preflight_started + explorer.budget.max_wall_time_s - explorer._prior_elapsed
+    for sample, chain in explorer.preflight_states(samples):
+        observation = _state_search_determinism_preflight(sample, chain, flash_base, erase_fill, deadline)
+        preflight.append(observation)
+        for name in ('computed_vs_live', 'computed_vs_repeat'):
+            comparison = observation[name]
+            if comparison['classification'] != 'identical traces':
+                failure = RecoveryTraceMismatch('state search determinism preflight ' + name,
+                                               comparison, 'recovery_state_determinism_preflight')
+                row = failure.result()
+                row['determinism_preflight'] = preflight
+                row['recovery_state_search_summary'] = {'complete': False, 'states_booted': 0, 'cross_checks_run': 0,
+                                                        'stopped_reason': 'determinism_preflight'}
+                return [row]
+    if preflight:
+        explorer._prior_elapsed += max(0.0, _time.time() - preflight_started)
+    try:
+        results, summary = explorer.run()
+    except RecoveryTraceMismatch as exc:
+        row = exc.result()
+        row['recovery_state_search_summary'] = dict(explorer.summary, complete=False, stopped_reason=exc.kind)
+        if preflight:
+            row['determinism_preflight'] = preflight
+        return [row]
+    if preflight:
+        summary['determinism_preflight'] = preflight
     if checkpoint_path and not explorer.plan_only:
         checkpoint = explorer.checkpoint(inputs)
         if checkpoint is not None or os.path.isfile(checkpoint_path):

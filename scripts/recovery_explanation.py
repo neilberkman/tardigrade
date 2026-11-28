@@ -18,6 +18,7 @@ from recovery_search import (
 )
 from recovery_state import PersistentState, merge_operation_traces
 from report_points import point_cuts, point_status
+from recovery_trace_comparison import comparison_message
 from source_locations import SourceLocations
 from trace_utils import (
     build_clean_operation_trace, load_clean_erase_trace, load_clean_write_trace,
@@ -898,6 +899,16 @@ def _message(endpoint, comparison, cuts=()):
     return f"{cut_clause} {state_clause}; {recovery_clause}"
 
 
+def _resolve_trace_comparison(comparison, source, drivers):
+    for pair in (comparison.get("first_differing_operation"),
+                 comparison.get("last_completed_writer"),
+                 comparison.get("interrupted_operation_covering_byte")):
+        for side in comparison["trace_lengths"]:
+            op = (pair or {}).get(side)
+            if op:
+                _attach_call_chain(op, op.get("pc"), op.get("call_context"), source, drivers)
+
+
 def explain_recovery_failures(
     rows,
     expected,
@@ -920,6 +931,13 @@ def explain_recovery_failures(
     comparisons = {}
     pre_states = {}
     for row in rows:
+        comparison = row.get("recovery_trace_comparison")
+        if comparison:
+            _resolve_trace_comparison(comparison, source, driver_functions)
+            row["error"] = row["error_reason"] + ": " + comparison_message(comparison)
+        for sample in row.get("determinism_preflight", ()):
+            for name in ("computed_vs_live", "computed_vs_repeat"):
+                _resolve_trace_comparison(sample[name], source, driver_functions)
         # Saved reports can have an earlier symbol in last_function even
         # when the terminal PC was outside the supplied ELF.
         explanation = row.get("failure_explanation")

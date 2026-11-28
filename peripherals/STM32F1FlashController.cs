@@ -382,6 +382,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             set => tracker.LastFaultCallContext = value;
         }
 
+        public RecoveryTraceTimes TraceTimes => tracker.TraceTimes;
         public string WriteCallContextToString() => tracker.WriteCallContextToString();
         public string EraseCallContextToString() => tracker.EraseCallContextToString();
 

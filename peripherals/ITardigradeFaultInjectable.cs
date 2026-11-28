@@ -1,10 +1,49 @@
 // Copyright (c) 2026
 // SPDX-License-Identifier: Apache-2.0
 
+using System.Collections.Generic;
 using Antmicro.Renode.Peripherals;
 
 namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
+    // The runner opens this clock while the CPU is paused at recovery reset.
+    // Operation indices belong to the same device counters as the data trace.
+    public sealed class RecoveryTraceTimes
+    {
+        public void Begin(Core.IMachine owner)
+        {
+            writes.Clear();
+            erases.Clear();
+            machine = owner;
+            startUs = machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds;
+        }
+
+        public void End()
+        {
+            machine = null;
+        }
+
+        public void Record(bool erase, ulong index)
+        {
+            if(machine != null)
+            {
+                var times = erase ? erases : writes;
+                times[index] = machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds - startUs;
+            }
+        }
+
+        public double Microseconds(bool erase, ulong index)
+        {
+            double value;
+            return (erase ? erases : writes).TryGetValue(index, out value) ? value : -1;
+        }
+
+        private Core.IMachine machine;
+        private double startUs;
+        private readonly Dictionary<ulong, double> writes = new Dictionary<ulong, double>();
+        private readonly Dictionary<ulong, double> erases = new Dictionary<ulong, double>();
+    }
+
     public interface ITardigradeFaultInjectable
     {
         IMemory Flash { get; }

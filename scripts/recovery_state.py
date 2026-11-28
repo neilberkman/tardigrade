@@ -449,6 +449,8 @@ def _normalize_operation(raw, kind=None, sequence=None):
                 "completed_value": completed_value,
             }
         )
+        if "intended_value" in operation:
+            normalized["intended_value"] = _coerce_integer(operation["intended_value"])
         if "pre_program_value" in operation:
             normalized["pre_program_value"] = _coerce_integer(
                 operation["pre_program_value"]
@@ -479,6 +481,8 @@ def _normalize_operation(raw, kind=None, sequence=None):
         pc_value = _coerce_integer(operation["pc"]) & 0xFFFFFFFF
         if pc_value != 0:
             normalized["pc"] = "0x{:08X}".format(pc_value)
+    if operation.get("virtual_us_since_reset") is not None:
+        normalized["virtual_us_since_reset"] = operation["virtual_us_since_reset"]
     if operation.get("call_context") not in (None, ""):
         normalized["call_context"] = str(operation["call_context"])
     return normalized

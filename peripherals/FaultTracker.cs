@@ -18,6 +18,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
 {
     public class FaultTracker
     {
+        public RecoveryTraceTimes TraceTimes { get; } = new RecoveryTraceTimes();
+
         public IMachine Machine;
         public IPeripheral Owner;
         private ulong cachedStackStart;
@@ -241,6 +243,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(WriteTraceEnabled)
             {
+                TraceTimes.Record(false, TotalWordWrites);
                 writeTrace.Add(Tuple.Create(TotalWordWrites, byteOffset, eventValue, width));
                 if(effectivePc != 0)
                 {
@@ -308,6 +311,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             }
             if(EraseTraceEnabled)
             {
+                TraceTimes.Record(true, TotalPageErases);
                 eraseTrace.Add(Tuple.Create(TotalPageErases, offset, TotalWordWrites, eraseSize, effectivePc));
                 if(!string.IsNullOrEmpty(effectiveCtx))
                 {

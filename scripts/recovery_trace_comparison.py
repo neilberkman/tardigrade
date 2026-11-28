@@ -27,7 +27,7 @@ def _event(ops, index, base, erase_fill):
 
 
 def compare_recovery_traces(computed, live, computed_start, live_start, base, erase_fill,
-                            state_difference=None, cut_reached=False, trace_bases=None):
+                            state_difference=None, cut_reached=False, trace_bases=None, other_side="live"):
     """Compare issued operations. Timing, stack and interrupted completion are evidence."""
     shorter = min(len(computed), len(live))
     first = None
@@ -58,18 +58,18 @@ def compare_recovery_traces(computed, live, computed_start, live_start, base, er
     else:
         classification = "identical traces"
 
-    sides = (("computed", computed), ("live", live))
+    sides = (("computed", computed), (other_side, live))
     result = {
         "classification": classification,
         "traces_identical": first is None,
         "trace_lengths": dict((side, len(ops)) for side, ops in sides),
         "starting_state_identical": (computed_start == live_start
                                      if computed_start is not None and live_start is not None else None),
-        "starting_state": {"computed": computed_start, "live": live_start},
+        "starting_state": {"computed": computed_start, other_side: live_start},
         "first_differing_operation": None,
     }
     if trace_bases:
-        result["tracking_base"] = dict(zip(("computed", "live"), trace_bases))
+        result["tracking_base"] = dict(zip(("computed", other_side), trace_bases))
     if first is not None:
         difference = dict((side, _event(ops, first, base, erase_fill)) for side, ops in sides)
         difference["index"] = first
@@ -99,15 +99,16 @@ def compare_recovery_traces(computed, live, computed_start, live_start, base, er
 
 def comparison_message(comparison):
     lengths = comparison["trace_lengths"]
-    message = "{} (computed {} ops, live {} ops, starting state {})".format(
-        comparison["classification"], lengths["computed"], lengths["live"],
+    other = "repeat" if "repeat" in lengths else "live"
+    message = "{} (computed {} ops, {} {} ops, starting state {})".format(
+        comparison["classification"], lengths["computed"], other, lengths[other],
         {True: "identical", False: "different", None: "unavailable"}[comparison["starting_state_identical"]])
     if "computed_full_trace_length" in comparison:
         message += ", full computed-source boot {} ops".format(comparison["computed_full_trace_length"])
     difference = comparison["first_differing_operation"]
     if difference:
         message += ", first difference at operation {}".format(difference["index"])
-        for side in ("computed", "live"):
+        for side in ("computed", other):
             op = difference[side]
             message += ", {} ".format(side)
             if op is None:
